@@ -7,7 +7,9 @@ function snapshotWith(chatTexts: string[]): RoomSnapshot {
   return {
     code: "ABC123",
     stage: "playing",
-    rules: {},
+    rules: { cooldownMs: 5000 },
+    clock: { value: 0, running: true },
+    serverTime: 0,
     game: createInitialState(),
     players: {
       white: { name: "anything a stranger typed", player: "white", connected: true, isHost: true },
