@@ -124,7 +124,7 @@ for (const size of Object.keys(SIZES)) {
   }
   // The guest drops out: the game pauses and every cooldown freezes. Then they come back.
   await guest.goto("about:blank");
-  await page.waitForSelector(".disconnected-event", { timeout: 10000 });
+  await page.waitForSelector(".disconnected-event", { timeout: 30000 });
   await shot(page, `${size}-8b-opponent-disconnected`);
   await guest.goBack();
   await guest.waitForSelector("text=Online match", { timeout: 20000 });

@@ -121,6 +121,10 @@ export function createGameServer(
     ServerSideEvents,
     SocketData
   >(httpServer, {
+    // Real time: notice a dropped player within a few seconds so the clock can pause.
+    // (Socket.IO's defaults allow up to 45 s, and hosting proxies can delay a close.)
+    pingInterval: 2_000,
+    pingTimeout: 3_000,
     cors: {
       origin: allowedOrigins,
       methods: ["GET", "POST"]
