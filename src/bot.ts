@@ -1,13 +1,21 @@
-// Chess bot: iterative-deepening alpha-beta search with quiescence over the shared rules engine.
-// It only touches the engine through generateLegalMoves, makeMove, isInCheck and applyMove, so a
-// variant that changes the rules gets a bot that follows them; `evaluate` is the chess-specific part.
+// The Cooldown Chess bot: a real-time agent, not a turn-based search.
+//
+// There are no turns to search over, so the bot scores the position it would be in after each
+// move it could play right now (one move ahead) with an evaluation that understands cooldowns:
+// a piece is "lost" when an enemy attacker will be ready before the piece can move away, and a
+// king in that state is the end of the game. It then plays the best-scoring move, or waits.
+//
+// Difficulty is mostly timing. Each level has a reaction delay (the bot decides from the board
+// as it was that long ago) and a minimum gap between its own moves. BotAgent.tick() is one
+// decision: well under a millisecond, called a few times a second, so it never blocks the page.
 import {
-  BOARD_SIZE,
-  applyMove,
-  generateLegalMoves,
-  getLegalMoves,
-  isInCheck,
+  cooldownLeft,
+  findKing,
+  getAttackers,
+  getMoves,
+  listPieces,
   makeMove,
+  opponentOf,
   type GameState,
   type Move,
   type PieceKind,
@@ -17,32 +25,34 @@ import {
 export type BotLevel = "easy" | "medium" | "hard";
 
 export const BOT_LEVELS: Record<BotLevel, { label: string; description: string }> = {
-  easy: { label: "Easy", description: "Learning the ropes. Misses things." },
-  medium: { label: "Medium", description: "Looks a few moves ahead." },
-  hard: { label: "Hard", description: "Thinks deep. Punishes mistakes." }
+  easy: { label: "Easy", description: "Slow hands. Leaves pieces hanging." },
+  medium: { label: "Medium", description: "Steady pace. Punishes loose pieces." },
+  hard: { label: "Hard", description: "Fast and dangerous. Guard your king." }
 };
 
-export type BotAction = { type: "move"; moveId: string };
-
-type LevelSettings = {
-  maxDepth: number;
-  timeLimitMs: number;
+export type LevelSettings = {
+  // The bot decides from the board as it was this long ago.
+  reactionMs: number;
+  // Minimum time between two of its own moves (varied by +-20% each time).
+  minGapMs: number;
   // Random score noise, in centipawns, so weaker bots pick imperfect moves.
   noise: number;
-  // Chance of playing a random legal move outright.
+  // Chance that a decision is a random ready move instead of the best one.
   blunderChance: number;
+  // How much of the danger to its own pieces it notices (1 = all of it).
+  riskAwareness: number;
+  // Taking a king and saving its own king skip the minimum gap.
+  urgentSkipsGap: boolean;
 };
 
-const LEVEL_SETTINGS: Record<BotLevel, LevelSettings> = {
-  easy: { maxDepth: 1, timeLimitMs: 200, noise: 140, blunderChance: 0.25 },
-  medium: { maxDepth: 3, timeLimitMs: 500, noise: 30, blunderChance: 0.03 },
-  hard: { maxDepth: 12, timeLimitMs: 900, noise: 0, blunderChance: 0 }
+export const LEVEL_SETTINGS: Record<BotLevel, LevelSettings> = {
+  easy: { reactionMs: 1000, minGapMs: 2400, noise: 160, blunderChance: 0.2, riskAwareness: 0.35, urgentSkipsGap: false },
+  medium: { reactionMs: 480, minGapMs: 1100, noise: 40, blunderChance: 0.02, riskAwareness: 0.9, urgentSkipsGap: true },
+  hard: { reactionMs: 150, minGapMs: 330, noise: 6, blunderChance: 0, riskAwareness: 1, urgentSkipsGap: true }
 };
 
-const WIN_SCORE = 100_000;
-const MAX_QUIESCENCE_PLIES = 6;
-// Check extensions stop this many plies past the nominal depth, so perpetual checks end.
-const MAX_EXTENSION_PLIES = 6;
+// How often the page (or a simulation) should call BotAgent.tick().
+export const BOT_TICK_MS = 90;
 
 export const PIECE_VALUE: Record<PieceKind, number> = {
   pawn: 100,
@@ -53,323 +63,165 @@ export const PIECE_VALUE: Record<PieceKind, number> = {
   king: 0
 };
 
-export type BotOptions = {
-  random?: () => number;
-  now?: () => number;
-  timeLimitMs?: number;
-};
+// A king that will be captured before it can move.
+const KING_LOST = 20_000;
+// A king that is attacked but still has time to step away.
+const KING_PRESSURE = 250;
+// The reaction time the bot assumes its opponent has.
+const OPPONENT_REACTION_MS = 400;
 
-export function chooseBotAction(state: GameState, level: BotLevel, botOptions: BotOptions = {}): BotAction | null {
-  const { random = Math.random, now = () => performance.now() } = botOptions;
-  const moves = getLegalMoves(state);
-  if (moves.length === 0) return null;
-  if (moves.length === 1) return { type: "move", moveId: moves[0].id };
-
-  const settings = LEVEL_SETTINGS[level];
-  if (random() < settings.blunderChance) {
-    return { type: "move", moveId: moves[Math.floor(random() * moves.length)].id };
-  }
-
-  const deadline = now() + (botOptions.timeLimitMs ?? settings.timeLimitMs);
-
-  // The real result of each root move, so the search knows about draws by repetition and the
-  // fifty-move rule, which the fast search states do not track.
-  type RootMove = { move: Move; next: GameState; fixed: number | null; score: number };
-  let root: RootMove[] = orderMoves(state, moves).map((move) => {
-    const played = applyMove(state, move.id);
-    const fixed = played.status.phase === "won" ? WIN_SCORE - 1 : played.status.phase === "draw" ? 0 : null;
-    return { move, next: played, fixed, score: 0 };
-  });
-
-  // Iterative deepening: keep the deepest fully searched result when time runs out.
-  for (let depth = 1; depth <= settings.maxDepth; depth += 1) {
-    const search = new Search(deadline, now, depth + MAX_EXTENSION_PLIES);
-    const scored: RootMove[] = [];
-    let alpha = -Infinity;
-    for (const entry of root) {
-      // Weaker levels add noise to every score, so each move needs a true score, not a bound.
-      const window = settings.noise > 0 ? -Infinity : alpha;
-      const score = entry.fixed ?? -search.negamax(entry.next, depth - 1, -Infinity, -window, 1);
-      if (search.timedOut) break;
-      scored.push({ ...entry, score });
-      alpha = Math.max(alpha, score);
-    }
-    // A pass cut off by the clock has unreliable scores; keep the previous depth.
-    if (search.timedOut) break;
-    // Best first, so the next iteration searches the strongest line first (better pruning).
-    // The sort is stable, so moves that only matched the bound keep their earlier order.
-    root = scored.sort((a, b) => b.score - a.score);
-    if (Math.abs(root[0].score) >= WIN_SCORE - 100) break;
-  }
-
-  if (settings.noise > 0) {
-    root = root
-      .map((entry) => ({ ...entry, score: entry.score + (random() * 2 - 1) * settings.noise }))
-      .sort((a, b) => b.score - a.score);
-  }
-  return { type: "move", moveId: root[0].move.id };
-}
-
-class Search {
-  timedOut = false;
-  private nodes = 0;
-
-  constructor(
-    private readonly deadline: number,
-    private readonly now: () => number,
-    private readonly maxPly: number
-  ) {}
-
-  // Score of `state` for the side to move.
-  negamax(state: GameState, depth: number, alpha: number, beta: number, ply: number): number {
-    if (++this.nodes % 128 === 0 && this.now() > this.deadline) this.timedOut = true;
-    if (this.timedOut) return 0;
-    if (state.halfmoveClock >= 100) return 0;
-
-    const player = state.currentPlayer;
-    const inCheck = isInCheck(state, player);
-    // Never stop searching while in check: the position is not quiet and may be mate.
-    if (inCheck && depth <= 0 && ply < this.maxPly) depth = 1;
-    if (depth <= 0) return this.quiesce(state, alpha, beta, 0);
-
-    const moves = generateLegalMoves(state);
-    if (moves.length === 0) {
-      // Checkmate, scored so faster mates are preferred; otherwise stalemate.
-      return inCheck ? -WIN_SCORE + ply : 0;
-    }
-
-    let best = -Infinity;
-    for (const child of orderChildren(state, moves, depth >= 2)) {
-      const next = child.next ?? makeMove(state, child.move);
-      const score = -this.negamax(next, depth - 1, -beta, -alpha, ply + 1);
-      if (this.timedOut) return 0;
-      if (score > best) best = score;
-      if (score > alpha) alpha = score;
-      if (alpha >= beta) break;
-    }
-    return best;
-  }
-
-  // Quiescence: keep resolving captures and promotions so the bot does not stop searching in
-  // the middle of an exchange.
-  private quiesce(state: GameState, alpha: number, beta: number, qply: number): number {
-    if (++this.nodes % 128 === 0 && this.now() > this.deadline) this.timedOut = true;
-    if (this.timedOut) return 0;
-
-    // The side to move can always decline the exchange ("stand pat").
-    const standPat = evaluate(state, state.currentPlayer);
-    if (standPat >= beta || qply >= MAX_QUIESCENCE_PLIES) return standPat;
-    if (standPat > alpha) alpha = standPat;
-
-    let best = standPat;
-    const tactical = generateLegalMoves(state, state.currentPlayer, { tacticalOnly: true });
-    for (const move of orderMoves(state, tactical)) {
-      const score = -this.quiesce(makeMove(state, move), -beta, -alpha, qply + 1);
-      if (this.timedOut) return 0;
-      if (score > best) best = score;
-      if (score > alpha) alpha = score;
-      if (alpha >= beta) break;
-    }
-    return best;
+// Small placement bonuses: develop the minor pieces, push pawns, keep the king at home.
+function placement(kind: PieceKind, player: Player, row: number, col: number): number {
+  const advance = player === "white" ? 7 - row : row;
+  const centre = 3.5 - Math.max(Math.abs(row - 3.5), Math.abs(col - 3.5));
+  switch (kind) {
+    case "pawn":
+      return advance * 7 + (col >= 2 && col <= 5 ? advance * 3 : 0);
+    case "knight":
+    case "bishop":
+      return (advance > 0 ? 22 : 0) + centre * 7;
+    case "queen":
+      return centre * 2;
+    case "king":
+      return -advance * 28;
+    default:
+      return 0;
   }
 }
 
-// Move ordering score: captures by most valuable victim / least valuable attacker, then promotions.
-function orderingScore(state: GameState, move: Move): number {
+// The position's worth to `me` at game time `now`, in centipawns: material, placement, and what
+// each side is about to lose given who is ready when.
+export function evaluate(state: GameState, me: Player, now: number, settings: LevelSettings = LEVEL_SETTINGS.hard): number {
   let score = 0;
-  const capture = move.captures[0];
-  if (capture) {
-    const victim = state.board[capture.row][capture.col];
-    score += 10_000 + (victim ? PIECE_VALUE[victim.kind] : 0) * 10 - PIECE_VALUE[move.pieceKind];
+  for (const { piece, square } of listPieces(state)) {
+    const mine = piece.player === me;
+    const sign = mine ? 1 : -1;
+    score += sign * (PIECE_VALUE[piece.kind] + placement(piece.kind, piece.player, square.row, square.col));
+
+    const attackers = getAttackers(state, square, opponentOf(piece.player));
+    if (attackers.length === 0) continue;
+    let threatIn = Infinity;
+    let cheapest = Infinity;
+    for (const attacker of attackers) {
+      threatIn = Math.min(threatIn, Math.max(0, attacker.piece.readyAt - now));
+      cheapest = Math.min(cheapest, PIECE_VALUE[attacker.piece.kind]);
+    }
+    const escapeIn = Math.max(0, piece.readyAt - now) + (mine ? settings.reactionMs : OPPONENT_REACTION_MS);
+    const trapped = threatIn <= escapeIn;
+
+    if (piece.kind === "king") {
+      // Its own king in danger outweighs everything; a threat to the enemy king is worth half
+      // as much when it is real, and little when the king can simply step away.
+      if (mine) score -= trapped ? KING_LOST : KING_PRESSURE;
+      else score += trapped ? KING_LOST * 0.5 : KING_PRESSURE * 0.2;
+      continue;
+    }
+    const defended = getAttackers(state, square, piece.player).length > 0;
+    let loss = defended ? Math.max(0, PIECE_VALUE[piece.kind] - cheapest) : PIECE_VALUE[piece.kind];
+    // It can still step away in time, but it is under pressure.
+    if (!trapped) loss *= 0.15;
+    score -= sign * loss * (mine ? settings.riskAwareness : 0.7);
   }
-  if (move.promotion) score += 8_000 + PIECE_VALUE[move.promotion];
-  if (move.castle) score += 50;
   return score;
 }
 
-function orderMoves(state: GameState, moves: Move[]): Move[] {
-  return moves
-    .map((move) => ({ move, score: orderingScore(state, move) }))
-    .sort((a, b) => b.score - a.score)
-    .map((entry) => entry.move);
-}
-
-// Like orderMoves, and with `withChecks` it also plays each move to rank checking moves early.
-// The played states are returned so the search does not make them twice.
-function orderChildren(state: GameState, moves: Move[], withChecks: boolean): { move: Move; next: GameState | null }[] {
-  return moves
-    .map((move) => {
-      let score = orderingScore(state, move);
-      let next: GameState | null = null;
-      if (withChecks) {
-        next = makeMove(state, move);
-        if (isInCheck(next, next.currentPlayer)) score += 9_000;
-      }
-      return { move, next, score };
-    })
-    .sort((a, b) => b.score - a.score);
-}
-
-// Piece-square tables from White's side, row 0 = rank 8 (the "simplified evaluation function"
-// tables by Tomasz Michniewski). Black reads them mirrored.
-const PAWN_TABLE = [
-  [0, 0, 0, 0, 0, 0, 0, 0],
-  [50, 50, 50, 50, 50, 50, 50, 50],
-  [10, 10, 20, 30, 30, 20, 10, 10],
-  [5, 5, 10, 25, 25, 10, 5, 5],
-  [0, 0, 0, 20, 20, 0, 0, 0],
-  [5, -5, -10, 0, 0, -10, -5, 5],
-  [5, 10, 10, -20, -20, 10, 10, 5],
-  [0, 0, 0, 0, 0, 0, 0, 0]
-];
-const KNIGHT_TABLE = [
-  [-50, -40, -30, -30, -30, -30, -40, -50],
-  [-40, -20, 0, 0, 0, 0, -20, -40],
-  [-30, 0, 10, 15, 15, 10, 0, -30],
-  [-30, 5, 15, 20, 20, 15, 5, -30],
-  [-30, 0, 15, 20, 20, 15, 0, -30],
-  [-30, 5, 10, 15, 15, 10, 5, -30],
-  [-40, -20, 0, 5, 5, 0, -20, -40],
-  [-50, -40, -30, -30, -30, -30, -40, -50]
-];
-const BISHOP_TABLE = [
-  [-20, -10, -10, -10, -10, -10, -10, -20],
-  [-10, 0, 0, 0, 0, 0, 0, -10],
-  [-10, 0, 5, 10, 10, 5, 0, -10],
-  [-10, 5, 5, 10, 10, 5, 5, -10],
-  [-10, 0, 10, 10, 10, 10, 0, -10],
-  [-10, 10, 10, 10, 10, 10, 10, -10],
-  [-10, 5, 0, 0, 0, 0, 5, -10],
-  [-20, -10, -10, -10, -10, -10, -10, -20]
-];
-const ROOK_TABLE = [
-  [0, 0, 0, 0, 0, 0, 0, 0],
-  [5, 10, 10, 10, 10, 10, 10, 5],
-  [-5, 0, 0, 0, 0, 0, 0, -5],
-  [-5, 0, 0, 0, 0, 0, 0, -5],
-  [-5, 0, 0, 0, 0, 0, 0, -5],
-  [-5, 0, 0, 0, 0, 0, 0, -5],
-  [-5, 0, 0, 0, 0, 0, 0, -5],
-  [0, 0, 0, 5, 5, 0, 0, 0]
-];
-const QUEEN_TABLE = [
-  [-20, -10, -10, -5, -5, -10, -10, -20],
-  [-10, 0, 0, 0, 0, 0, 0, -10],
-  [-10, 0, 5, 5, 5, 5, 0, -10],
-  [-5, 0, 5, 5, 5, 5, 0, -5],
-  [0, 0, 5, 5, 5, 5, 0, -5],
-  [-10, 5, 5, 5, 5, 5, 0, -10],
-  [-10, 0, 5, 0, 0, 0, 0, -10],
-  [-20, -10, -10, -5, -5, -10, -10, -20]
-];
-const KING_MIDDLE_TABLE = [
-  [-30, -40, -40, -50, -50, -40, -40, -30],
-  [-30, -40, -40, -50, -50, -40, -40, -30],
-  [-30, -40, -40, -50, -50, -40, -40, -30],
-  [-30, -40, -40, -50, -50, -40, -40, -30],
-  [-20, -30, -30, -40, -40, -30, -30, -20],
-  [-10, -20, -20, -20, -20, -20, -20, -10],
-  [20, 20, 0, 0, 0, 0, 20, 20],
-  [20, 30, 10, 0, 0, 10, 30, 20]
-];
-const KING_END_TABLE = [
-  [-50, -40, -30, -20, -20, -30, -40, -50],
-  [-30, -20, -10, 0, 0, -10, -20, -30],
-  [-30, -10, 20, 30, 30, 20, -10, -30],
-  [-30, -10, 30, 40, 40, 30, -10, -30],
-  [-30, -10, 30, 40, 40, 30, -10, -30],
-  [-30, -10, 20, 30, 30, 20, -10, -30],
-  [-30, -30, 0, 0, 0, 0, -30, -30],
-  [-50, -30, -30, -30, -30, -30, -30, -50]
-];
-const TABLES: Record<Exclude<PieceKind, "king">, number[][]> = {
-  pawn: PAWN_TABLE,
-  knight: KNIGHT_TABLE,
-  bishop: BISHOP_TABLE,
-  rook: ROOK_TABLE,
-  queen: QUEEN_TABLE
+export type BotChoice = {
+  moveId: string;
+  // Taking a king, or saving its own.
+  urgent: boolean;
 };
-// Non-pawn material of both sides at the start; the game "phase" runs from 1 (opening) to 0.
-const FULL_PHASE_MATERIAL = 2 * (2 * 320 + 2 * 330 + 2 * 500 + 900);
 
-// Static evaluation from `me`'s point of view, in centipawns: material, piece-square tables,
-// the bishop pair, a pawn shield in front of the king, and pushed pawns in the endgame.
-export function evaluate(state: GameState, me: Player): number {
-  const board = state.board;
-  let score = 0; // White minus Black
-  let nonPawnMaterial = 0;
-  let whiteBishops = 0;
-  let blackBishops = 0;
-  let whiteKingRow = -1;
-  let whiteKingCol = -1;
-  let blackKingRow = -1;
-  let blackKingCol = -1;
-  let whitePawnAdvance = 0;
-  let blackPawnAdvance = 0;
+// Picks a move for `player` from `state` at game time `now`, or null to wait.
+export function chooseBotMove(
+  state: GameState,
+  player: Player,
+  now: number,
+  level: BotLevel,
+  random: () => number = Math.random
+): BotChoice | null {
+  const settings = LEVEL_SETTINGS[level];
+  const moves = getMoves(state, player, now);
+  if (moves.length === 0) return null;
 
-  for (let row = 0; row < BOARD_SIZE; row += 1) {
-    for (let col = 0; col < BOARD_SIZE; col += 1) {
-      const piece = board[row][col];
-      if (!piece) continue;
-      const white = piece.player === "white";
-      if (piece.kind === "king") {
-        if (white) {
-          whiteKingRow = row;
-          whiteKingCol = col;
-        } else {
-          blackKingRow = row;
-          blackKingCol = col;
-        }
-        continue;
-      }
-      const tableRow = white ? row : BOARD_SIZE - 1 - row;
-      const value = PIECE_VALUE[piece.kind] + TABLES[piece.kind][tableRow][col];
-      score += white ? value : -value;
-      if (piece.kind === "pawn") {
-        const advance = BOARD_SIZE - 2 - tableRow; // 0 on the start rank, 5 one step from promoting
-        if (white) whitePawnAdvance += advance * advance;
-        else blackPawnAdvance += advance * advance;
-      } else {
-        nonPawnMaterial += PIECE_VALUE[piece.kind];
-        if (piece.kind === "bishop") {
-          if (white) whiteBishops += 1;
-          else blackBishops += 1;
-        }
-      }
+  const kingCapture = moves.find((move) => capturesKing(state, move));
+  if (kingCapture) return { moveId: kingCapture.id, urgent: true };
+
+  const baseline = evaluate(state, player, now, settings);
+  // Its own king is about to be taken: nothing else matters, and nothing is left to chance.
+  const kingInDanger = isKingTrapped(state, player, now, settings.reactionMs);
+
+  if (!kingInDanger && random() < settings.blunderChance) {
+    return { moveId: moves[Math.floor(random() * moves.length)].id, urgent: false };
+  }
+
+  let best: Move | null = null;
+  let bestScore = -Infinity;
+  for (const move of moves) {
+    const next = makeMove(state, move, now);
+    const noise = kingInDanger ? 0 : (random() - 0.5) * 2 * settings.noise;
+    const score = evaluate(next, player, now, settings) - baseline + noise;
+    if (score > bestScore) {
+      bestScore = score;
+      best = move;
     }
   }
-
-  if (whiteBishops >= 2) score += 30;
-  if (blackBishops >= 2) score -= 30;
-
-  const phase = Math.min(1, nonPawnMaterial / FULL_PHASE_MATERIAL);
-  score += (whitePawnAdvance - blackPawnAdvance) * 3 * (1 - phase);
-
-  if (whiteKingRow >= 0) {
-    score +=
-      KING_MIDDLE_TABLE[whiteKingRow][whiteKingCol] * phase +
-      KING_END_TABLE[whiteKingRow][whiteKingCol] * (1 - phase) +
-      pawnShield(state, "white", whiteKingRow, whiteKingCol) * 12 * phase;
-  }
-  if (blackKingRow >= 0) {
-    const mirrored = BOARD_SIZE - 1 - blackKingRow;
-    score -=
-      KING_MIDDLE_TABLE[mirrored][blackKingCol] * phase +
-      KING_END_TABLE[mirrored][blackKingCol] * (1 - phase) +
-      pawnShield(state, "black", blackKingRow, blackKingCol) * 12 * phase;
-  }
-
-  return me === "white" ? score : -score;
+  // Waiting is a move too: only act when something actually gets better.
+  if (!best || bestScore <= 1) return null;
+  return { moveId: best.id, urgent: kingInDanger };
 }
 
-// Friendly pawns on the three squares directly in front of the king.
-function pawnShield(state: GameState, player: Player, row: number, col: number): number {
-  const front = row + (player === "white" ? -1 : 1);
-  if (front < 0 || front >= BOARD_SIZE) return 0;
-  let count = 0;
-  for (let c = col - 1; c <= col + 1; c += 1) {
-    const piece = state.board[front][c];
-    if (piece && piece.kind === "pawn" && piece.player === player) count += 1;
+function capturesKing(state: GameState, move: Move) {
+  return move.captures.some((capture) => state.board[capture.row][capture.col]?.kind === "king");
+}
+
+// True when an enemy piece that attacks `player`'s king will be ready before the king can move
+// (allowing `reactionMs` for the player to notice).
+export function isKingTrapped(state: GameState, player: Player, now: number, reactionMs: number): boolean {
+  const king = findKing(state, player);
+  if (!king) return false;
+  const escapeIn = cooldownLeft(state.board[king.row][king.col]!, now) + reactionMs;
+  return getAttackers(state, king, opponentOf(player)).some((attacker) => cooldownLeft(attacker.piece, now) <= escapeIn);
+}
+
+// One bot playing one side of one game. Feed it the current state on every tick; it answers
+// with a move id to play now, or null. Time is the game clock, so it pauses with the game.
+export class BotAgent {
+  private readonly settings: LevelSettings;
+  // States the bot has been shown, oldest first, with the time each becomes "seen".
+  private history: { seenAt: number; state: GameState }[] = [];
+  private latest: GameState | null = null;
+  private nextMoveAt = -Infinity;
+
+  constructor(
+    readonly player: Player,
+    readonly level: BotLevel,
+    private readonly random: () => number = Math.random
+  ) {
+    this.settings = LEVEL_SETTINGS[level];
   }
-  return count;
+
+  tick(state: GameState, now: number): string | null {
+    if (state !== this.latest) {
+      this.latest = state;
+      // The bot knows its own moves at once; everything else takes its reaction time to register.
+      const own = state.moveLog[state.moveLog.length - 1]?.player === this.player;
+      const previous = this.history[this.history.length - 1]?.seenAt ?? -Infinity;
+      this.history.push({ seenAt: Math.max(previous, own ? now : now + this.settings.reactionMs), state });
+    }
+    if (state.status.phase !== "playing" || now < 0) return null;
+
+    while (this.history.length > 1 && this.history[1].seenAt <= now) this.history.shift();
+    const view = this.history[0];
+    // Nothing but the starting position is known before the first reaction time has passed.
+    if (view.seenAt > now && view.state.moveLog.length > 0) return null;
+
+    const choice = chooseBotMove(view.state, this.player, now, this.level, this.random);
+    if (!choice) return null;
+    if (now < this.nextMoveAt && !(choice.urgent && this.settings.urgentSkipsGap)) return null;
+    // The board may have changed since the view was taken; a move that no longer exists is dropped.
+    if (!getMoves(state, this.player, now).some((move) => move.id === choice.moveId)) return null;
+
+    this.nextMoveAt = now + this.settings.minGapMs * (0.8 + this.random() * 0.4);
+    return choice.moveId;
+  }
 }

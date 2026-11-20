@@ -1,146 +1,183 @@
 import { describe, expect, it } from "vitest";
-import { chooseBotAction, evaluate, type BotLevel } from "../src/bot";
-import {
-  applyMove,
-  createInitialState,
-  fromFen,
-  getLegalMoves,
-  getMaterial,
-  type GameState,
-  type Player
-} from "../src/game";
+import { BOT_TICK_MS, BotAgent, LEVEL_SETTINGS, chooseBotMove, evaluate, isKingTrapped, type BotLevel } from "../src/bot";
+import { applyMove, createInitialState, fromFen, getMoves, type GameState, type Player } from "../src/game";
 
+// A small seeded generator so every bot decision in these tests is repeatable.
 function seeded(seed: number) {
   return () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
 }
 
-function botMove(state: GameState, level: BotLevel = "hard", timeLimitMs = 900) {
-  const action = chooseBotAction(state, level, { random: seeded(12345), timeLimitMs });
-  if (!action) throw new Error("The bot returned no move");
-  expect(getLegalMoves(state).map((move) => move.id)).toContain(action.moveId);
-  return action.moveId;
-}
-
-// True when the bot, to move in `state`, forces checkmate within `moves` of its own moves
-// against every defence.
-function forcesMate(state: GameState, moves: number): boolean {
-  const me = state.currentPlayer;
-  const after = applyMove(state, botMove(state));
-  if (after.status.phase === "won") return after.status.winner === me;
-  if (after.status.phase !== "playing" || moves <= 1) return false;
-  return getLegalMoves(after).every((reply) => forcesMate(applyMove(after, reply.id), moves - 1));
-}
-
-function playGame(white: BotLevel, black: BotLevel, seed: number, maxPlies: number, timeLimitMs: number) {
+// Plays two bots against each other on a simulated game clock (no real waiting).
+function simulate(white: BotLevel, black: BotLevel, seed: number, cooldownMs = 3000, maxMs = 240_000) {
   const random = seeded(seed);
-  let state = createInitialState();
-  for (let ply = 0; ply < maxPlies && state.status.phase === "playing"; ply += 1) {
-    const level = state.currentPlayer === "white" ? white : black;
-    const action = chooseBotAction(state, level, { random, timeLimitMs });
-    if (!action) break;
-    state = applyMove(state, action.moveId);
-  }
-  return state;
-}
-
-// Positive when `player` is ahead at the end: a win, or more material when the game was cut short.
-function lead(state: GameState, player: Player) {
-  if (state.status.phase === "won") return state.status.winner === player ? 100 : -100;
-  const { score } = getMaterial(state);
-  return score[player] - score[player === "white" ? "black" : "white"];
-}
-
-describe("bot", () => {
-  it("returns a legal move at every level", () => {
-    const state = createInitialState();
-    for (const level of ["easy", "medium", "hard"] as const) botMove(state, level, 150);
-  });
-
-  it("returns null when the game is over", () => {
-    expect(chooseBotAction(fromFen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1"), "hard")).toBeNull();
-  });
-
-  it("finds mate in one", () => {
-    expect(botMove(fromFen("6k1/5ppp/8/8/8/8/8/R3K3 w - - 0 1"))).toBe("a1a8");
-    // Black to move: fool's mate.
-    expect(botMove(fromFen("rnbqkbnr/pppp1ppp/8/4p3/6P1/5P2/PPPPP2P/RNBQKBNR b KQkq g3 0 2"))).toBe("d8h4");
-    // Scholar's mate.
-    expect(botMove(fromFen("r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4"))).toBe("h5f7");
-  });
-
-  it("finds mate in two with a rook ladder", () => {
-    expect(forcesMate(fromFen("7k/8/8/8/8/8/R7/1R2K3 w - - 0 1"), 2)).toBe(true);
-  });
-
-  it("finds mate in two with a quiet rook sacrifice", () => {
-    // 1. Ra6! bxa6 2. b7#, or any bishop move 2. Rxa7#.
-    const state = fromFen("kbK5/pp6/1P6/8/8/8/8/R7 w - - 0 1");
-    expect(botMove(state)).toBe("a1a6");
-    expect(forcesMate(state, 2)).toBe(true);
-  });
-
-  it("finds mate in two as Black", () => {
-    expect(forcesMate(fromFen("1r2k3/r7/8/8/8/8/8/7K b - - 0 1"), 2)).toBe(true);
-  });
-
-  it("takes a hanging queen", () => {
-    const state = fromFen("4k3/p7/8/3q4/8/4N3/P7/4K3 w - - 0 1");
-    expect(botMove(state, "hard", 300)).toBe("e3d5");
-    expect(botMove(state, "medium", 300)).toBe("e3d5");
-  });
-
-  it("does not leave its queen to be taken", () => {
-    // The queen on d4 is attacked by the knight; every level-headed bot moves or defends it.
-    const state = fromFen("4k3/8/2n5/8/3Q4/8/8/4K3 w - - 0 1");
-    const after = applyMove(state, botMove(state, "hard", 300));
-    const queenTaken = getLegalMoves(after).some((move) => {
-      const target = move.captures[0];
-      return target && after.board[target.row][target.col]?.kind === "queen";
-    });
-    expect(queenTaken).toBe(false);
-  });
-
-  it("prefers a win to a draw by repetition", () => {
-    // White is a queen up. After this shuffle, Qd2 would repeat a position for the third time.
-    let state = fromFen("6k1/8/8/8/8/8/5PPP/4Q1K1 w - - 0 1");
-    for (const moveId of ["e1d2", "g8h8", "d2d1", "h8g8", "d1d2", "g8h8", "d2d1", "h8g8"]) {
-      state = applyMove(state, moveId);
+  const agents = { white: new BotAgent("white", white, random), black: new BotAgent("black", black, random) };
+  let state = createInitialState({ cooldownMs });
+  let now = -500;
+  for (; now < maxMs && state.status.phase === "playing"; now += BOT_TICK_MS / 2) {
+    // Alternate who is asked first so neither side gets the earlier slot every tick.
+    const order: Player[] = Math.floor(now / BOT_TICK_MS) % 2 === 0 ? ["white", "black"] : ["black", "white"];
+    for (const player of order) {
+      const moveId = agents[player].tick(state, now);
+      if (moveId) state = applyMove(state, player, moveId, now);
     }
-    expect(applyMove(state, "d1d2").status).toMatchObject({ phase: "draw", reason: "threefold-repetition" });
-    const moveId = botMove(state, "hard", 300);
-    expect(moveId).not.toBe("d1d2");
-    expect(applyMove(state, moveId).status.phase).toBe("playing");
+  }
+  return { state, now };
+}
+
+describe("bot decisions", () => {
+  it("takes a king that can be captured, at every level", () => {
+    const state = fromFen("4k3/8/8/8/8/8/4q3/R3K3");
+    for (const level of ["easy", "medium", "hard"] as const) {
+      expect(chooseBotMove(state, "black", 0, level, seeded(3))).toEqual({ moveId: "e2e1", urgent: true });
+      expect(chooseBotMove(state, "white", 0, level, seeded(3))).toMatchObject({ moveId: "e1e2" });
+    }
   });
 
-  it("values material and development sensibly", () => {
-    expect(evaluate(createInitialState(), "white")).toBe(0);
-    const queenUp = fromFen("rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-    expect(evaluate(queenUp, "white")).toBeGreaterThan(800);
-    expect(evaluate(queenUp, "black")).toBe(-evaluate(queenUp, "white"));
+  it("moves an attacked king out of danger, or removes the attacker", () => {
+    // The rook attacks the king down the e-file and is ready.
+    const attacked = fromFen("4k3/8/8/8/4r3/8/8/3QK3");
+    expect(isKingTrapped(attacked, "white", 0, 150)).toBe(true);
+    for (const level of ["easy", "medium", "hard"] as const) {
+      const choice = chooseBotMove(attacked, "white", 0, level, seeded(11));
+      expect(choice?.urgent).toBe(true);
+      const next = applyMove(attacked, "white", choice!.moveId, 0);
+      expect(isKingTrapped(next, "white", 0, 150)).toBe(false);
+    }
+    // When the attacker can simply be taken, that is the answer.
+    const takeable = fromFen("7k/8/8/8/Q3r3/8/8/4K3");
+    expect(chooseBotMove(takeable, "white", 0, "hard", seeded(1))).toEqual({ moveId: "a4e4", urgent: true });
   });
 
-  it("hard beats easy", () => {
-    expect(lead(playGame("hard", "easy", 3, 120, 40), "white")).toBeGreaterThan(5);
-    expect(lead(playGame("easy", "hard", 4, 120, 40), "black")).toBeGreaterThan(5);
-  }, 60_000);
+  it("knows a cooling attacker is not yet a threat, and when it becomes one", () => {
+    let state = fromFen("4k3/8/8/8/7r/8/8/4K3", { cooldownMs: 5000 });
+    state = applyMove(state, "black", "h4e4", 0);
+    // The rook needs 5 s; the king is ready and has time.
+    expect(isKingTrapped(state, "white", 100, 150)).toBe(false);
+    // With 100 ms left on the rook, a 150 ms reaction is too slow: now it is urgent.
+    expect(isKingTrapped(state, "white", 4900, 150)).toBe(true);
+    const choice = chooseBotMove(state, "white", 4900, "hard", seeded(5));
+    expect(choice?.urgent).toBe(true);
+    expect(choice?.moveId.startsWith("e1")).toBe(true);
+  });
+
+  it("grabs free material and prefers the bigger prize", () => {
+    const state = fromFen("4k3/8/8/3q4/8/2n5/1P6/4K1B1 -");
+    // The pawn can take the knight; nothing defends it.
+    expect(chooseBotMove(state, "white", 0, "hard", seeded(2))?.moveId).toBe("b2c3");
+    const queen = fromFen("4k3/8/8/3q4/8/2n1B3/1P6/4K3 -");
+    const both = fromFen("4k3/8/8/8/3q4/2n1B3/1P6/4K3 -");
+    expect(chooseBotMove(queen, "white", 0, "hard", seeded(2))?.moveId).toBe("b2c3");
+    expect(chooseBotMove(both, "white", 0, "hard", seeded(2))?.moveId).toBe("e3d4");
+  });
+
+  it("does not move onto a square a ready enemy piece attacks, but will if that piece is cooling long enough", () => {
+    // The pawn on d5 is defended by the pawn on e6.
+    const defended = fromFen("4k3/8/4p3/3p4/8/8/8/3QK3 -");
+    expect(chooseBotMove(defended, "white", 0, "hard", seeded(4))?.moveId).not.toBe("d1d5");
+    const loose = fromFen("4k3/8/8/3p4/8/8/8/3QK3 -");
+    expect(chooseBotMove(loose, "white", 0, "hard", seeded(4))?.moveId).toBe("d1d5");
+    // Evaluation: a queen standing where a ready pawn can take it is worth far less.
+    const hanging = fromFen("4k3/8/4p3/3Q4/8/8/8/4K3 -");
+    const safe = fromFen("4k3/8/4p3/8/3Q4/8/8/4K3 -");
+    expect(evaluate(safe, "white", 0) - evaluate(hanging, "white", 0)).toBeGreaterThan(500);
+  });
+
+  it("only ever returns a move that is legal right now", () => {
+    const random = seeded(9);
+    let state = createInitialState();
+    let now = 0;
+    for (let step = 0; step < 300 && state.status.phase === "playing"; step += 1, now += 120) {
+      const player: Player = step % 2 === 0 ? "white" : "black";
+      const choice = chooseBotMove(state, player, now, step % 3 === 0 ? "easy" : "hard", random);
+      if (!choice) continue;
+      expect(getMoves(state, player, now).map((move) => move.id)).toContain(choice.moveId);
+      state = applyMove(state, player, choice.moveId, now);
+    }
+    expect(state.moveLog.length).toBeGreaterThan(30);
+  });
+});
+
+describe("the bot as a real-time agent", () => {
+  it("waits for the countdown, then respects its reaction time and minimum gap", () => {
+    for (const level of ["easy", "medium", "hard"] as const) {
+      const settings = LEVEL_SETTINGS[level];
+      const agent = new BotAgent("black", level, seeded(21));
+      let state: GameState = createInitialState();
+      const times: number[] = [];
+      for (let now = -3000; now < 20_000; now += 30) {
+        const moveId = agent.tick(state, now);
+        if (!moveId) continue;
+        expect(now).toBeGreaterThanOrEqual(0);
+        state = applyMove(state, "black", moveId, now);
+        // Taking the king skips the gap (and ends the game), so it is not part of this check.
+        if (state.status.phase !== "playing") break;
+        times.push(now);
+      }
+      expect(times.length).toBeGreaterThan(2);
+      const gaps = times.slice(1).map((time, index) => time - times[index]);
+      expect(Math.min(...gaps)).toBeGreaterThanOrEqual(settings.minGapMs * 0.8 - 30);
+    }
+  });
+
+  it("is faster at higher levels", () => {
+    const count = (level: BotLevel) => {
+      const agent = new BotAgent("white", level, seeded(8));
+      let state: GameState = createInitialState();
+      for (let now = 0; now < 12_000; now += 45) {
+        const moveId = agent.tick(state, now);
+        if (moveId) state = applyMove(state, "white", moveId, now);
+      }
+      return state.moveLog.length;
+    };
+    const [easy, medium, hard] = [count("easy"), count("medium"), count("hard")];
+    expect(easy).toBeLessThan(medium);
+    expect(medium).toBeLessThan(hard);
+    expect(easy).toBeLessThanOrEqual(7);
+  });
+
+  it("notices a capturable king only after its reaction time, and medium and hard then take it at once", () => {
+    for (const level of ["medium", "hard"] as const) {
+      const reaction = LEVEL_SETTINGS[level].reactionMs;
+      const agent = new BotAgent("black", level, seeded(13));
+      // Black's rook is ready on the e-file; White's king stands safely on d1.
+      const before = fromFen("4k3/8/8/8/4r3/8/3P4/3K4");
+      agent.tick(before, 0);
+      agent.tick(before, 900);
+      // At 1000 ms White blunders onto the rook's file.
+      const blundered = applyMove(before, "white", "d1e1", 1000);
+      let takenAt: number | null = null;
+      for (let now = 1000; now < 4000 && takenAt === null; now += 10) {
+        if (agent.tick(blundered, now) === "e4e1") takenAt = now;
+      }
+      expect(takenAt).not.toBeNull();
+      expect(takenAt! - 1000).toBeGreaterThanOrEqual(reaction);
+      expect(takenAt! - 1000).toBeLessThanOrEqual(reaction + 10);
+    }
+  });
+
+  it("decides in well under a millisecond on average", () => {
+    const state = applyMove(applyMove(createInitialState(), "white", "e2e4", 0), "black", "d7d5", 0);
+    const started = performance.now();
+    for (let index = 0; index < 400; index += 1) chooseBotMove(state, "white", 6000, "hard", seeded(index + 1));
+    expect((performance.now() - started) / 400).toBeLessThan(2);
+  });
+
+  it("hard beats easy over several simulated games", () => {
+    const results = [101, 202, 303, 404, 505, 606].map((seed, index) => {
+      const hardSide: Player = index % 2 === 0 ? "white" : "black";
+      const { state } = hardSide === "white" ? simulate("hard", "easy", seed) : simulate("easy", "hard", seed);
+      return state.status.phase === "won" ? (state.status.winner === hardSide ? "hard" : "easy") : "none";
+    });
+    expect(results.filter((result) => result === "easy")).toHaveLength(0);
+    expect(results.filter((result) => result === "hard").length).toBeGreaterThanOrEqual(5);
+  });
 
   it("medium beats easy more often than not", () => {
-    let total = 0;
-    for (let seed = 1; seed <= 3; seed += 1) {
-      total += Math.sign(lead(playGame("medium", "easy", seed, 100, 40), "white"));
-      total += Math.sign(lead(playGame("easy", "medium", seed + 50, 100, 40), "black"));
-    }
-    expect(total).toBeGreaterThanOrEqual(2);
-  }, 90_000);
-
-  it("hard answers within its time budget", () => {
-    for (const fen of [
-      "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-      "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"
-    ]) {
-      const started = performance.now();
-      chooseBotAction(fromFen(fen), "hard");
-      expect(performance.now() - started).toBeLessThan(1300);
-    }
+    const results = [11, 22, 33, 44, 55, 66].map((seed, index) => {
+      const side: Player = index % 2 === 0 ? "white" : "black";
+      const { state } = side === "white" ? simulate("medium", "easy", seed) : simulate("easy", "medium", seed);
+      return state.status.phase === "won" ? (state.status.winner === side ? "medium" : "easy") : "none";
+    });
+    expect(results.filter((result) => result === "medium").length).toBeGreaterThan(results.filter((result) => result === "easy").length);
   });
 });

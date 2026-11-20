@@ -1,20 +1,35 @@
+// The room server: private rooms, quick match, reconnects, rematches, quick-message chat, and
+// the authoritative real-time game.
+//
+// Real-time model: clients send move intents ("e2e4"). Node handles socket events one at a
+// time, so intents are applied strictly in arrival order. Each one is stamped with the room's
+// game clock as the server reads it at that instant, validated by the engine and either applied
+// and broadcast, or refused with the reason. Nothing a client says about time is trusted.
 import { randomUUID } from "node:crypto";
 import { createServer, type Server as HttpServer } from "node:http";
 import { pathToFileURL } from "node:url";
 import { Server, type Socket } from "socket.io";
 import {
-  applyMove,
+  PAUSE_ON_DISCONNECT,
+  clockNow,
   createInitialState,
+  describeReject,
+  idleClock,
+  isRunning,
   normalizeRules,
-  sameRules,
+  pauseClock,
   resignGame,
+  resumeClock,
+  sameRules,
+  tryMove,
+  type GameClock,
   type GameRules,
   type GameState,
   type Player
 } from "./rules";
 import type {
   ClientToServerEvents,
-  MatchmakingPayload,
+  MoveRejectReason,
   PlayerSession,
   PublicRoomPlayer,
   RoomConnection,
@@ -46,6 +61,8 @@ type GameRoom = {
   code: string;
   rules: GameRules;
   game: GameState;
+  // The game clock every cooldown in `game` is measured on.
+  clock: GameClock;
   players: Record<Player, RoomSeat | null>;
   rematchVotes: Set<Player>;
   chat: RoomChatMessage[];
@@ -62,24 +79,36 @@ type QueueEntry = {
 };
 
 const ROOM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-const DEFAULT_PORT = 4275;
+const DEFAULT_PORT = 4375;
 const MAX_CHAT_MESSAGES = 80;
 const MAX_CHAT_LENGTH = 240;
 const CHAT_COOLDOWN_MS = 350;
 const DEFAULT_DISCONNECT_GRACE_MS = 30_000;
+// Move rate limit per socket (a token bucket). A player has at most 16 pieces and the shortest
+// cooldown is 3 s, so honest play cannot sustain even 6 accepted moves a second; mis-taps on
+// cooling pieces are stopped by the client before they are sent.
+export const MOVE_BURST = 24;
+export const MOVES_PER_SECOND = 12;
+
+export type GameServerOptions = {
+  disconnectGraceMs?: number;
+  // The server's wall clock in milliseconds. Tests pass a counter they control.
+  now?: () => number;
+};
 
 export function createGameServer(
   httpServer: HttpServer = createHealthServer(),
-  options: { disconnectGraceMs?: number } = {}
+  options: GameServerOptions = {}
 ) {
   const rooms = new Map<string, GameRoom>();
   const queue: QueueEntry[] = [];
   const disconnectGraceMs = options.disconnectGraceMs ?? DEFAULT_DISCONNECT_GRACE_MS;
+  const wallNow = options.now ?? Date.now;
   const allowedOrigins = (
     process.env.CLIENT_ORIGINS ??
     [
-      "http://127.0.0.1:4274",
-      "http://localhost:4274"
+      "http://127.0.0.1:4374",
+      "http://localhost:4374"
     ].join(",")
   )
     .split(",")
@@ -99,6 +128,10 @@ export function createGameServer(
   });
 
   io.on("connection", (socket) => {
+    socket.on("clock:sync", (ack) => {
+      if (typeof ack === "function") ack(wallNow());
+    });
+
     socket.on("room:create", (payload, ack) => {
       leaveCurrentRoom(socket, false);
       removeFromQueue(socket.id);
@@ -129,6 +162,8 @@ export function createGameServer(
       leaveCurrentRoom(socket, false);
       removeFromQueue(socket.id);
       seatPlayer(room, socket, openSeat, payload.name, payload.playerId, false);
+      // Both seats are filled: the countdown starts now.
+      startGame(room);
       bumpRevision(room);
       const connection = connectionFor(room, openSeat);
       ackSuccess(ack, connection);
@@ -151,6 +186,7 @@ export function createGameServer(
       clearDisconnectDeadline(room, session.player);
       socket.data.session = sessionFor(room, session.player);
       socket.join(room.code);
+      syncClock(room);
       bumpRevision(room);
       ackSuccess(ack, connectionFor(room, session.player));
       broadcastRoom(room);
@@ -159,41 +195,45 @@ export function createGameServer(
     socket.on("room:move", (moveId, ack) => {
       const membership = getMembership(socket);
       if (!membership) {
-        ackFailure(ack, "You are not in a game.");
+        rejectMove(ack, "not-in-game", "You are not in a game.");
+        return;
+      }
+
+      if (!takeMoveToken(socket)) {
+        rejectMove(ack, "rate-limited", "Too many moves at once. Slow down a little.");
         return;
       }
 
       const { room, player } = membership;
       if (!room.players.white || !room.players.black) {
-        ackFailure(ack, "The game is still waiting for another player.");
-        return;
-      }
-
-      const opponent = player === "white" ? "black" : "white";
-      if (!room.players[opponent]?.connected) {
-        ackFailure(ack, "Wait for your opponent to reconnect.");
+        rejectMove(ack, "not-started", "The game is still waiting for another player.");
         return;
       }
 
       if (room.game.status.phase !== "playing") {
-        ackFailure(ack, "That game is already over.");
+        rejectMove(ack, "game-over", describeReject("game-over"));
         return;
       }
 
-      if (room.game.currentPlayer !== player) {
-        ackFailure(ack, "It is not your turn.");
+      if (!isRunning(room.clock)) {
+        rejectMove(ack, "paused", "The game is paused until your opponent reconnects.");
         return;
       }
 
-      try {
-        room.game = applyMove(room.game, moveId);
-        room.rematchVotes.clear();
-        bumpRevision(room);
-        ackSuccess(ack, null);
-        broadcastRoom(room);
-      } catch {
-        ackFailure(ack, "That move is no longer legal.");
+      // The one place a move meets the clock: the server's reading at arrival.
+      const now = clockNow(room.clock, wallNow());
+      const result = tryMove(room.game, player, moveId, now);
+      if (!result.ok) {
+        rejectMove(ack, result.reason, describeReject(result.reason, result.readyInMs), result.readyInMs);
+        return;
       }
+
+      room.game = result.state;
+      room.rematchVotes.clear();
+      syncClock(room);
+      bumpRevision(room);
+      ackSuccess(ack, null);
+      broadcastRoom(room);
     });
 
     socket.on("room:resign", (ack) => {
@@ -211,6 +251,7 @@ export function createGameServer(
 
       room.game = resignGame(room.game, player);
       room.rematchVotes.clear();
+      syncClock(room);
       bumpRevision(room);
       ackSuccess(ack, null);
       broadcastRoom(room);
@@ -237,8 +278,8 @@ export function createGameServer(
 
       room.rematchVotes.add(player);
       if (room.rematchVotes.size === 2) {
-        room.game = createInitialState(room.rules);
         room.rematchVotes.clear();
+        startGame(room);
       }
 
       bumpRevision(room);
@@ -303,6 +344,7 @@ export function createGameServer(
 
       room.rules = normalizeRules(rules);
       room.game = createInitialState(room.rules);
+      room.clock = idleClock();
       bumpRevision(room);
       ackSuccess(ack, null);
       broadcastRoom(room);
@@ -317,6 +359,7 @@ export function createGameServer(
       leaveCurrentRoom(socket, false);
       removeFromQueue(socket.id);
 
+      // Only players who asked for the same cooldown length are paired.
       const opponentIndex = queue.findIndex(
         (entry) =>
           entry.socketId !== socket.id &&
@@ -353,7 +396,7 @@ export function createGameServer(
         return;
       }
 
-      // Quick match assigns colors at random; White still moves first.
+      // Quick match assigns colors at random.
       const room = createRoom(rooms, payload.rules);
       const waitingColor: Player = Math.random() < 0.5 ? "white" : "black";
       const joiningColor: Player = waitingColor === "white" ? "black" : "white";
@@ -362,6 +405,7 @@ export function createGameServer(
       rooms.set(room.code, room);
       opponentSocket.data.queued = false;
       socket.data.queued = false;
+      startGame(room);
       bumpRevision(room);
 
       ackSuccess(ack, { queued: false });
@@ -388,11 +432,41 @@ export function createGameServer(
         seat.socketId = null;
         seat.connected = false;
         scheduleDisconnectDeadline(membership.room, membership.player);
+        // Every cooldown freezes while a seated player is away.
+        syncClock(membership.room);
         bumpRevision(membership.room);
         broadcastRoom(membership.room);
       }
     });
   });
+
+  // A fresh board and a clock at the top of the countdown, running if both players are here.
+  function startGame(room: GameRoom) {
+    room.game = createInitialState(room.rules);
+    room.clock = idleClock();
+    syncClock(room);
+  }
+
+  // The clock runs exactly while a game is in progress with both players connected.
+  function syncClock(room: GameRoom) {
+    const seated = Boolean(room.players.white && room.players.black);
+    const present = Boolean(room.players.white?.connected && room.players.black?.connected);
+    const live = room.game.status.phase === "playing" && seated && (present || !PAUSE_ON_DISCONNECT);
+    room.clock = live ? resumeClock(room.clock, wallNow()) : pauseClock(room.clock, wallNow());
+  }
+
+  function takeMoveToken(socket: GameSocket) {
+    const now = wallNow();
+    const elapsed = Math.max(0, now - (socket.data.moveTokensAt ?? now));
+    const tokens = Math.min(MOVE_BURST, (socket.data.moveTokens ?? MOVE_BURST) + (elapsed / 1000) * MOVES_PER_SECOND);
+    socket.data.moveTokensAt = now;
+    if (tokens < 1) {
+      socket.data.moveTokens = tokens;
+      return false;
+    }
+    socket.data.moveTokens = tokens - 1;
+    return true;
+  }
 
   function removeFromQueue(socketId: string) {
     const index = queue.findIndex((entry) => entry.socketId === socketId);
@@ -449,6 +523,7 @@ export function createGameServer(
       seat.socketId = null;
       seat.reconnectToken = randomUUID();
       room.rematchVotes.delete(player);
+      syncClock(room);
       bumpRevision(room);
       broadcastRoom(room);
 
@@ -460,6 +535,7 @@ export function createGameServer(
 
     room.players[player] = null;
     room.rematchVotes.delete(player);
+    syncClock(room);
     bumpRevision(room);
     broadcastRoom(room);
   }
@@ -482,6 +558,7 @@ export function createGameServer(
 
       room.game = resignGame(room.game, player);
       room.rematchVotes.clear();
+      syncClock(room);
       bumpRevision(room);
       broadcastRoom(room);
 
@@ -502,6 +579,65 @@ export function createGameServer(
     clearDisconnectDeadline(room, "white");
     clearDisconnectDeadline(room, "black");
     rooms.delete(room.code);
+  }
+
+  function snapshotRoom(room: GameRoom): RoomSnapshot {
+    const serverTime = wallNow();
+    return {
+      code: room.code,
+      stage: room.players.white && room.players.black
+        ? room.game.status.phase === "playing"
+          ? "playing"
+          : "finished"
+        : "waiting",
+      rules: room.rules,
+      game: room.game,
+      clock: { value: clockNow(room.clock, serverTime), running: isRunning(room.clock) },
+      serverTime,
+      players: {
+        white: publicSeat(room.players.white),
+        black: publicSeat(room.players.black)
+      },
+      rematchVotes: [...room.rematchVotes],
+      chat: room.chat,
+      disconnectDeadlines: room.disconnectDeadlines,
+      revision: room.revision
+    };
+  }
+
+  function connectionFor(room: GameRoom, player: Player): RoomConnection {
+    return {
+      session: sessionFor(room, player),
+      snapshot: snapshotRoom(room)
+    };
+  }
+
+  function seatPlayer(
+    room: GameRoom,
+    socket: GameSocket,
+    player: Player,
+    name: string,
+    playerId: unknown,
+    isHost: boolean
+  ): RoomConnection {
+    const reconnectToken = randomUUID();
+    room.players[player] = {
+      name: normalizeName(name),
+      player,
+      connected: true,
+      isHost,
+      reconnectToken,
+      socketId: socket.id,
+      playerId: isPlayerId(playerId) ? playerId : null
+    };
+
+    socket.data.session = {
+      roomCode: room.code,
+      player,
+      reconnectToken
+    };
+    socket.join(room.code);
+    return connectionFor(room, player);
   }
 
   function broadcastRoom(room: GameRoom) {
@@ -541,7 +677,7 @@ function createHealthServer() {
   return createServer((request, response) => {
     if (request.url === "/health") {
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ ok: true, service: "chess-base" }));
+      response.end(JSON.stringify({ ok: true, service: "cooldown-chess" }));
       return;
     }
 
@@ -561,47 +697,13 @@ function createRoom(rooms: Map<string, GameRoom>, rules: GameRules): GameRoom {
     code,
     rules: normalizedRules,
     game: createInitialState(normalizedRules),
+    clock: idleClock(),
     players: { white: null, black: null },
     rematchVotes: new Set<Player>(),
     chat: [],
     disconnectDeadlines: { white: null, black: null },
     disconnectTimers: { white: null, black: null },
     revision: 1
-  };
-}
-
-function seatPlayer(
-  room: GameRoom,
-  socket: GameSocket,
-  player: Player,
-  name: string,
-  playerId: unknown,
-  isHost: boolean
-): RoomConnection {
-  const reconnectToken = randomUUID();
-  room.players[player] = {
-    name: normalizeName(name),
-    player,
-    connected: true,
-    isHost,
-    reconnectToken,
-    socketId: socket.id,
-    playerId: isPlayerId(playerId) ? playerId : null
-  };
-
-  socket.data.session = {
-    roomCode: room.code,
-    player,
-    reconnectToken
-  };
-  socket.join(room.code);
-  return connectionFor(room, player);
-}
-
-function connectionFor(room: GameRoom, player: Player): RoomConnection {
-  return {
-    session: sessionFor(room, player),
-    snapshot: snapshotRoom(room)
   };
 }
 
@@ -615,27 +717,6 @@ function sessionFor(room: GameRoom, player: Player): PlayerSession {
     roomCode: room.code,
     player,
     reconnectToken: seat.reconnectToken
-  };
-}
-
-function snapshotRoom(room: GameRoom): RoomSnapshot {
-  return {
-    code: room.code,
-    stage: room.players.white && room.players.black
-      ? room.game.status.phase === "playing"
-        ? "playing"
-        : "finished"
-      : "waiting",
-    rules: room.rules,
-    game: room.game,
-    players: {
-      white: publicSeat(room.players.white),
-      black: publicSeat(room.players.black)
-    },
-    rematchVotes: [...room.rematchVotes],
-    chat: room.chat,
-    disconnectDeadlines: room.disconnectDeadlines,
-    revision: room.revision
   };
 }
 
@@ -668,11 +749,11 @@ function normalizeName(name: unknown) {
 }
 
 function normalizeCode(code: string) {
-  return code.trim().toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6);
+  return String(code).trim().toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6);
 }
 
 function normalizeChatMessage(message: string) {
-  return message.trim().replace(/\s+/g, " ").slice(0, MAX_CHAT_LENGTH);
+  return String(message).trim().replace(/\s+/g, " ").slice(0, MAX_CHAT_LENGTH);
 }
 
 function createRoomCode() {
@@ -687,6 +768,10 @@ function ackSuccess<T>(ack: ServerAck<T>, data: T) {
 
 function ackFailure<T>(ack: ServerAck<T>, message: string) {
   ack({ ok: false, message });
+}
+
+function rejectMove(ack: ServerAck<null>, reason: MoveRejectReason, message: string, readyInMs?: number) {
+  ack(readyInMs === undefined ? { ok: false, message, reason } : { ok: false, message, reason, readyInMs });
 }
 
 const isDirectRun =
@@ -705,7 +790,7 @@ if (isDirectRun) {
   gameServer
     .listen()
     .then((port) => {
-      process.stdout.write(`Chess game server listening on ${host}:${port}\n`);
+      process.stdout.write(`Cooldown Chess game server listening on ${host}:${port}\n`);
     })
     .catch((error: unknown) => {
       process.stderr.write(`${String(error)}\n`);

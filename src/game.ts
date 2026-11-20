@@ -1,10 +1,24 @@
-// Chess rules engine. Pure TypeScript: no UI, no DOM, no randomness, no clock.
+// Cooldown Chess rules engine. Pure TypeScript: no UI, no DOM, no randomness and no clock of
+// its own. Every function that depends on time takes `now`, the game clock in milliseconds
+// (src/variant/clock.ts), so the same state, move and time always give the same result.
 //
-// Move generation is two layers so a variant can recombine them:
-//   1. getPseudoLegalMoves  - how each piece moves, ignoring check entirely
-//   2. isLegalMove          - the check rules, built on isSquareAttacked
-// generateLegalMoves = layer 1 filtered by layer 2. A variant changes `variantOptions` below
-// (or the two layers themselves) and the shell, the bot and the server follow.
+// There are no turns and no check rules. A piece may move whenever the game clock has reached
+// its `readyAt`; moving it sets `readyAt` to now + the cooldown. Capturing the king wins.
+// The decisions the game's creator did not specify live in src/variant/interpretation.ts.
+
+import {
+  AUTO_PROMOTION,
+  CASTLING_ALLOWED,
+  CASTLING_COOLS_ROOK,
+  CASTLING_NEEDS_SAFE_SQUARES,
+  COOLDOWN_AFTER_CAPTURE,
+  COOLDOWN_AFTER_PROMOTION,
+  COOLDOWN_CHOICES_MS,
+  DEFAULT_COOLDOWN_MS,
+  DRAW_ON_BARE_KINGS,
+  EN_PASSANT_WINDOW,
+  KING_DANGER_SOON_MS
+} from "./variant/interpretation";
 
 export const BOARD_SIZE = 8;
 
@@ -26,6 +40,12 @@ export type Piece = {
   id: string;
   player: Player;
   kind: PieceKind;
+  // Game-clock time from which this piece may move again. 0 for a piece that has not moved.
+  readyAt: number;
+  // True once the piece has moved (castling needs an unmoved king and rook).
+  moved: boolean;
+  // Set on a pawn that just advanced two squares: it can be taken en passant until this time.
+  enPassantUntil: number | null;
 };
 
 export type Capture = Square & {
@@ -35,7 +55,7 @@ export type Capture = Square & {
 export type CastleSide = "king" | "queen";
 
 export type Move = {
-  // Long algebraic: "e2e4", "e7e8q". Unique among the legal moves of a position.
+  // Long algebraic, origin then destination: "e2e4". Unique among a player's moves.
   id: string;
   pieceId: string;
   pieceKind: PieceKind;
@@ -52,68 +72,43 @@ export type Move = {
 };
 
 export type MoveLogEntry = {
-  // Full-move number (1 for White's and Black's first moves).
-  turn: number;
+  // Game-clock time the move was applied at.
+  at: number;
   player: Player;
   pieceId: string;
   pieceKind: PieceKind;
   from: Square;
   to: Square;
   captured: PieceKind[];
-  // Standard algebraic notation, e.g. "Nbd7", "exd8=Q+", "O-O".
+  // Algebraic notation without check marks (there is no check): "Nbd7", "exd8=Q", "O-O".
   notation: string;
   promotion?: PromotionKind;
   rook?: { pieceId: string; from: Square; to: Square };
-  check: boolean;
 };
 
-export type DrawReason = "stalemate" | "threefold-repetition" | "fifty-move" | "insufficient-material";
+export type DrawReason = "bare-kings";
 
 export type GameStatus =
-  | {
-      phase: "playing";
-      // True when the side to move is in check.
-      check: boolean;
-      message: string;
-    }
-  | {
-      phase: "won";
-      winner: Player;
-      reason: "checkmate" | "resignation";
-      message: string;
-    }
-  | {
-      phase: "draw";
-      reason: DrawReason;
-      message: string;
-    };
+  | { phase: "playing"; message: string }
+  | { phase: "won"; winner: Player; reason: "king-captured" | "resignation"; message: string }
+  | { phase: "draw"; reason: DrawReason; message: string };
 
-// Options a game is created with. Plain chess has none; a variant adds its switches here,
-// gives them defaults in DEFAULT_GAME_RULES and sanitises them in normalizeRules.
-// eslint-disable-next-line @typescript-eslint/no-empty-object-type
-export type GameRules = {};
+// Options a game is created with: the cooldown every piece gets after it moves.
+export type GameRules = {
+  cooldownMs: number;
+};
 
-export const DEFAULT_GAME_RULES: GameRules = {};
+export const DEFAULT_GAME_RULES: GameRules = { cooldownMs: DEFAULT_COOLDOWN_MS };
 
 // Sanitises rules that came from storage or from another player's client.
 export function normalizeRules(rules: unknown): GameRules {
-  void rules;
-  return {};
+  const value = (rules as { cooldownMs?: unknown } | null | undefined)?.cooldownMs;
+  const allowed = (COOLDOWN_CHOICES_MS as readonly number[]).includes(value as number);
+  return { cooldownMs: allowed ? (value as number) : DEFAULT_COOLDOWN_MS };
 }
-
-export type CastlingRights = Record<Player, { kingSide: boolean; queenSide: boolean }>;
 
 export type GameState = {
   board: (Piece | null)[][];
-  currentPlayer: Player;
-  castling: CastlingRights;
-  // The square a pawn skipped on the previous move, if it just advanced two squares.
-  enPassant: Square | null;
-  // Half-moves since the last capture or pawn move (fifty-move rule).
-  halfmoveClock: number;
-  fullmoveNumber: number;
-  // How often each position has occurred since the last irreversible move (threefold repetition).
-  positionCounts: Record<string, number>;
   rules: GameRules;
   moveLog: MoveLogEntry[];
   status: GameStatus;
@@ -124,45 +119,23 @@ export type LocatedPiece = {
   square: Square;
 };
 
-// ---------------------------------------------------------------------------------------------
-// Variant hooks
-// ---------------------------------------------------------------------------------------------
-
 export type AttackOptions = {
   // Which pieces count as attackers. Default: every piece. A piece that cannot attack still blocks.
   canAttack?: (piece: Piece, from: Square, state: GameState) => boolean;
-  // Pieces that sliding attacks pass straight through. Default: none.
-  isTransparent?: (piece: Piece, at: Square, state: GameState) => boolean;
 };
 
-export type MoveGenOptions = {
-  // Which enemy pieces `attacker` may capture. Default: any enemy piece.
-  canCapture?: (attacker: Piece, target: Piece, at: Square, state: GameState) => boolean;
-  // Which pieces may move at all. Default: every piece.
-  canMove?: (piece: Piece, from: Square, state: GameState) => boolean;
-  // Only captures and promotions (used by the bot's quiescence search).
-  tacticalOnly?: boolean;
-};
+// Why a move was refused. The server sends this back to the client that asked.
+export type RejectReason = "game-over" | "not-started" | "no-piece" | "cooling" | "illegal";
 
-export type LegalityOptions = {
-  moves?: MoveGenOptions;
-  attacks?: AttackOptions;
-  // False turns the check rules off entirely: every pseudo-legal move is legal.
-  checkRules?: boolean;
-};
-
-// THE VARIANT SEAM. Everything that asks "what is legal here?" (getLegalMoves, applyMove, the
-// status after each move, the bot) goes through these options. Plain chess uses the defaults.
-export function variantOptions(state: GameState): LegalityOptions {
-  void state;
-  return {};
-}
+export type MoveResult =
+  | { ok: true; state: GameState; move: Move }
+  | { ok: false; reason: RejectReason; readyInMs?: number };
 
 // ---------------------------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------------------------
 
-export const START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+export const START_PLACEMENT = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR";
 
 const FEN_KINDS: Record<string, PieceKind> = { p: "pawn", n: "knight", b: "bishop", r: "rook", q: "queen", k: "king" };
 const KIND_LETTERS: Record<PieceKind, string> = { pawn: "p", knight: "n", bishop: "b", rook: "r", queen: "q", king: "k" };
@@ -178,15 +151,19 @@ const SQUARE_NAMES: string[][] = Array.from({ length: BOARD_SIZE }, (_, row) =>
   Array.from({ length: BOARD_SIZE }, (_, col) => `${String.fromCharCode(97 + col)}${BOARD_SIZE - row}`)
 );
 
+const PLAYING: GameStatus = { phase: "playing", message: "" };
+
 export function createInitialState(rules: GameRules = DEFAULT_GAME_RULES): GameState {
-  return fromFen(START_FEN, rules);
+  return fromFen(START_PLACEMENT, rules);
 }
 
-// Builds a game from a FEN string. Piece ids are derived from the squares in the FEN.
+// Builds a position from the piece-placement field of a FEN string (tests and tools use this).
+// An optional second field gives castling rights ("KQkq", "-"); without it, kings and rooks on
+// their home squares count as unmoved. Every piece starts ready. Piece ids come from the squares.
 export function fromFen(fen: string, rules: GameRules = DEFAULT_GAME_RULES): GameState {
-  const fields = fen.trim().split(/\s+/);
-  if (fields.length < 4) throw new Error(`Invalid FEN: ${fen}`);
-  const [placement, side, castlingField, enPassantField, halfmove = "0", fullmove = "1"] = fields;
+  const [placement, second, third] = fen.trim().split(/\s+/);
+  // Accept a full FEN too: its second field is the side to move, which this game does not have.
+  const castlingField = second === "w" || second === "b" ? third : second;
   const rows = placement.split("/");
   if (rows.length !== BOARD_SIZE) throw new Error(`Invalid FEN board: ${fen}`);
 
@@ -201,35 +178,36 @@ export function fromFen(fen: string, rules: GameRules = DEFAULT_GAME_RULES): Gam
       const kind = FEN_KINDS[char.toLowerCase()];
       if (!kind || col >= BOARD_SIZE) throw new Error(`Invalid FEN board: ${fen}`);
       const player: Player = char === char.toLowerCase() ? "black" : "white";
-      board[row][col] = { id: `${player}-${kind}-${SQUARE_NAMES[row][col]}`, player, kind };
+      board[row][col] = {
+        id: `${player}-${kind}-${SQUARE_NAMES[row][col]}`,
+        player,
+        kind,
+        readyAt: 0,
+        moved: !isHomeSquare(kind, player, row, col, castlingField),
+        enPassantUntil: null
+      };
       col += 1;
     }
     if (col !== BOARD_SIZE) throw new Error(`Invalid FEN board: ${fen}`);
   });
 
-  if (side !== "w" && side !== "b") throw new Error(`Invalid FEN side to move: ${fen}`);
-
-  const state: GameState = {
-    board,
-    currentPlayer: side === "w" ? "white" : "black",
-    castling: {
-      white: { kingSide: castlingField.includes("K"), queenSide: castlingField.includes("Q") },
-      black: { kingSide: castlingField.includes("k"), queenSide: castlingField.includes("q") }
-    },
-    enPassant: enPassantField === "-" ? null : parseSquare(enPassantField),
-    halfmoveClock: Number(halfmove) || 0,
-    fullmoveNumber: Number(fullmove) || 1,
-    positionCounts: {},
-    rules,
-    moveLog: [],
-    status: PLAYING
-  };
-  state.positionCounts = { [positionKey(state)]: 1 };
+  const state: GameState = { board, rules: normalizeRules(rules), moveLog: [], status: PLAYING };
   return { ...state, status: evaluateStatus(state) };
 }
 
-export function toFen(state: GameState): string {
-  const placement = state.board
+function isHomeSquare(kind: PieceKind, player: Player, row: number, col: number, castling: string | undefined) {
+  const homeRow = player === "white" ? BOARD_SIZE - 1 : 0;
+  const has = (letter: string) =>
+    castling === undefined || castling.includes(player === "white" ? letter.toUpperCase() : letter);
+  if (kind === "king") return row === homeRow && col === 4 && (has("k") || has("q"));
+  if (kind === "rook") return row === homeRow && ((col === 0 && has("q")) || (col === BOARD_SIZE - 1 && has("k")));
+  if (kind === "pawn") return row === (player === "white" ? BOARD_SIZE - 2 : 1);
+  return row === homeRow;
+}
+
+// The piece placement as a FEN field, for tests and debugging.
+export function toPlacement(state: GameState): string {
+  return state.board
     .map((row) => {
       let text = "";
       let empty = 0;
@@ -246,64 +224,40 @@ export function toFen(state: GameState): string {
       return empty ? text + empty : text;
     })
     .join("/");
-  const enPassant = state.enPassant ? SQUARE_NAMES[state.enPassant.row][state.enPassant.col] : "-";
-  return [
-    placement,
-    state.currentPlayer === "white" ? "w" : "b",
-    castlingText(state.castling),
-    enPassant,
-    state.halfmoveClock,
-    state.fullmoveNumber
-  ].join(" ");
 }
 
 // ---------------------------------------------------------------------------------------------
-// Layer 1: pseudo-legal moves (piece movement only, no check rules)
+// Piece movement
 // ---------------------------------------------------------------------------------------------
 
-export function getPseudoLegalMoves(
-  state: GameState,
-  player: Player = state.currentPlayer,
-  options: MoveGenOptions = {}
-): Move[] {
-  const moves: Move[] = [];
-  for (let row = 0; row < BOARD_SIZE; row += 1) {
-    for (let col = 0; col < BOARD_SIZE; col += 1) {
-      const piece = state.board[row][col];
-      if (piece && piece.player === player) addPieceMoves(state, piece, row, col, options, moves);
-    }
-  }
-  return moves;
-}
-
-export function getPseudoLegalMovesForPiece(state: GameState, from: Square, options: MoveGenOptions = {}): Move[] {
-  const piece = getPieceAt(state, from);
-  const moves: Move[] = [];
-  if (piece) addPieceMoves(state, piece, from.row, from.col, options, moves);
-  return moves;
-}
+type MoveGenOptions = {
+  // Only pieces that are ready at this time move. Undefined: cooldowns are ignored.
+  readyAt?: number;
+  // The time used for the en passant window. Undefined: any pawn that still carries its mark.
+  now?: number;
+};
 
 function addPieceMoves(state: GameState, piece: Piece, row: number, col: number, options: MoveGenOptions, out: Move[]) {
-  if (options.canMove && !options.canMove(piece, { row, col }, state)) return;
+  if (options.readyAt !== undefined && options.readyAt < piece.readyAt) return;
   switch (piece.kind) {
     case "pawn":
       addPawnMoves(state, piece, row, col, options, out);
       break;
     case "knight":
-      addStepMoves(state, piece, row, col, KNIGHT_OFFSETS, options, out);
+      addStepMoves(state, piece, row, col, KNIGHT_OFFSETS, out);
       break;
     case "bishop":
-      addSlideMoves(state, piece, row, col, DIAGONALS, options, out);
+      addSlideMoves(state, piece, row, col, DIAGONALS, out);
       break;
     case "rook":
-      addSlideMoves(state, piece, row, col, ORTHOGONALS, options, out);
+      addSlideMoves(state, piece, row, col, ORTHOGONALS, out);
       break;
     case "queen":
-      addSlideMoves(state, piece, row, col, ALL_DIRECTIONS, options, out);
+      addSlideMoves(state, piece, row, col, ALL_DIRECTIONS, out);
       break;
     case "king":
-      addStepMoves(state, piece, row, col, ALL_DIRECTIONS, options, out);
-      if (!options.tacticalOnly) addCastlingMoves(state, piece, row, col, out);
+      addStepMoves(state, piece, row, col, ALL_DIRECTIONS, out);
+      addCastlingMoves(state, piece, row, col, options, out);
       break;
   }
 }
@@ -314,11 +268,10 @@ function makeMoveRecord(
   fromCol: number,
   toRow: number,
   toCol: number,
-  captured: Piece | null,
-  promotion?: PromotionKind
+  captured: Piece | null
 ): Move {
-  const move: Move = {
-    id: SQUARE_NAMES[fromRow][fromCol] + SQUARE_NAMES[toRow][toCol] + (promotion ? KIND_LETTERS[promotion] : ""),
+  return {
+    id: SQUARE_NAMES[fromRow][fromCol] + SQUARE_NAMES[toRow][toCol],
     pieceId: piece.id,
     pieceKind: piece.kind,
     player: piece.player,
@@ -326,13 +279,6 @@ function makeMoveRecord(
     to: { row: toRow, col: toCol },
     captures: captured ? [{ row: toRow, col: toCol, pieceId: captured.id }] : []
   };
-  if (promotion) move.promotion = promotion;
-  return move;
-}
-
-function mayCapture(state: GameState, piece: Piece, target: Piece, row: number, col: number, options: MoveGenOptions) {
-  if (target.player === piece.player) return false;
-  return options.canCapture ? options.canCapture(piece, target, { row, col }, state) : true;
 }
 
 function addStepMoves(
@@ -341,7 +287,6 @@ function addStepMoves(
   row: number,
   col: number,
   offsets: readonly (readonly [number, number])[],
-  options: MoveGenOptions,
   out: Move[]
 ) {
   for (const [dr, dc] of offsets) {
@@ -349,11 +294,7 @@ function addStepMoves(
     const c = col + dc;
     if (r < 0 || r >= BOARD_SIZE || c < 0 || c >= BOARD_SIZE) continue;
     const target = state.board[r][c];
-    if (!target) {
-      if (!options.tacticalOnly) out.push(makeMoveRecord(piece, row, col, r, c, null));
-    } else if (mayCapture(state, piece, target, r, c, options)) {
-      out.push(makeMoveRecord(piece, row, col, r, c, target));
-    }
+    if (!target || target.player !== piece.player) out.push(makeMoveRecord(piece, row, col, r, c, target));
   }
 }
 
@@ -363,7 +304,6 @@ function addSlideMoves(
   row: number,
   col: number,
   directions: readonly (readonly [number, number])[],
-  options: MoveGenOptions,
   out: Move[]
 ) {
   for (const [dr, dc] of directions) {
@@ -372,10 +312,10 @@ function addSlideMoves(
     while (r >= 0 && r < BOARD_SIZE && c >= 0 && c < BOARD_SIZE) {
       const target = state.board[r][c];
       if (target) {
-        if (mayCapture(state, piece, target, r, c, options)) out.push(makeMoveRecord(piece, row, col, r, c, target));
+        if (target.player !== piece.player) out.push(makeMoveRecord(piece, row, col, r, c, target));
         break;
       }
-      if (!options.tacticalOnly) out.push(makeMoveRecord(piece, row, col, r, c, null));
+      out.push(makeMoveRecord(piece, row, col, r, c, null));
       r += dr;
       c += dc;
     }
@@ -390,18 +330,14 @@ function addPawnMoves(state: GameState, piece: Piece, row: number, col: number, 
   if (r < 0 || r >= BOARD_SIZE) return;
 
   const push = (toRow: number, toCol: number, captured: Piece | null) => {
-    if (toRow === promotionRow) {
-      for (const kind of PROMOTION_KINDS) out.push(makeMoveRecord(piece, row, col, toRow, toCol, captured, kind));
-    } else {
-      out.push(makeMoveRecord(piece, row, col, toRow, toCol, captured));
-    }
+    const move = makeMoveRecord(piece, row, col, toRow, toCol, captured);
+    if (toRow === promotionRow) move.promotion = AUTO_PROMOTION;
+    out.push(move);
   };
 
-  if (!state.board[r][col] && (!options.tacticalOnly || r === promotionRow)) {
+  if (!state.board[r][col]) {
     push(r, col, null);
-    if (row === startRow && !state.board[r + forward][col] && !options.tacticalOnly) {
-      out.push(makeMoveRecord(piece, row, col, r + forward, col, null));
-    }
+    if (row === startRow && !state.board[r + forward][col]) push(r + forward, col, null);
   }
 
   for (const dc of [-1, 1]) {
@@ -409,66 +345,102 @@ function addPawnMoves(state: GameState, piece: Piece, row: number, col: number, 
     if (c < 0 || c >= BOARD_SIZE) continue;
     const target = state.board[r][c];
     if (target) {
-      if (mayCapture(state, piece, target, r, c, options)) push(r, c, target);
+      if (target.player !== piece.player) push(r, c, target);
       continue;
     }
-    const enPassant = state.enPassant;
-    if (enPassant && enPassant.row === r && enPassant.col === c) {
-      const victim = state.board[row][c];
-      if (victim && victim.kind === "pawn" && mayCapture(state, piece, victim, row, c, options)) {
-        const move = makeMoveRecord(piece, row, col, r, c, null);
-        move.captures = [{ row, col: c, pieceId: victim.id }];
-        move.enPassant = true;
-        out.push(move);
-      }
+    // En passant: the pawn beside this one double-stepped and its window is still open.
+    const victim = state.board[row][c];
+    if (
+      EN_PASSANT_WINDOW === "while-cooling" &&
+      victim &&
+      victim.kind === "pawn" &&
+      victim.player !== piece.player &&
+      victim.enPassantUntil !== null &&
+      (options.now === undefined || options.now < victim.enPassantUntil)
+    ) {
+      const move = makeMoveRecord(piece, row, col, r, c, null);
+      move.captures = [{ row, col: c, pieceId: victim.id }];
+      move.enPassant = true;
+      out.push(move);
     }
   }
 }
 
-// Castling by rights and empty squares only. "Not out of, through or into check" is a check
-// rule, so it lives in isLegalMove.
-function addCastlingMoves(state: GameState, king: Piece, row: number, col: number, out: Move[]) {
+// Castling: the king and that rook have never moved and the squares between them are empty.
+function addCastlingMoves(state: GameState, king: Piece, row: number, col: number, options: MoveGenOptions, out: Move[]) {
+  if (!CASTLING_ALLOWED || king.moved) return;
   const homeRow = king.player === "white" ? BOARD_SIZE - 1 : 0;
   if (row !== homeRow || col !== 4) return;
-  const rights = state.castling[king.player];
   const boardRow = state.board[row];
+  const enemy = opponentOf(king.player);
 
   const add = (side: CastleSide, rookCol: number, kingTo: number, rookTo: number, empty: number[]) => {
     const rook = boardRow[rookCol];
-    if (!rook || rook.kind !== "rook" || rook.player !== king.player) return;
+    if (!rook || rook.kind !== "rook" || rook.player !== king.player || rook.moved) return;
+    if (options.readyAt !== undefined && options.readyAt < rook.readyAt) return;
     if (empty.some((c) => boardRow[c])) return;
+    if (CASTLING_NEEDS_SAFE_SQUARES && [col, (col + kingTo) / 2, kingTo].some((c) => isSquareAttacked(state, { row, col: c }, enemy))) return;
     const move = makeMoveRecord(king, row, col, row, kingTo, null);
     move.castle = side;
     move.rook = { pieceId: rook.id, from: { row, col: rookCol }, to: { row, col: rookTo } };
     out.push(move);
   };
 
-  if (rights.kingSide) add("king", 7, 6, 5, [5, 6]);
-  if (rights.queenSide) add("queen", 0, 2, 3, [1, 2, 3]);
+  add("king", 7, 6, 5, [5, 6]);
+  add("queen", 0, 2, 3, [1, 2, 3]);
+}
+
+function collectMoves(state: GameState, player: Player, options: MoveGenOptions): Move[] {
+  const moves: Move[] = [];
+  for (let row = 0; row < BOARD_SIZE; row += 1) {
+    for (let col = 0; col < BOARD_SIZE; col += 1) {
+      const piece = state.board[row][col];
+      if (piece && piece.player === player) addPieceMoves(state, piece, row, col, options, moves);
+    }
+  }
+  return moves;
+}
+
+// The moves `player` may play at game time `now`: those of the pieces that are ready.
+// Empty before the start countdown ends (now < 0) and once the game is over.
+export function getMoves(state: GameState, player: Player, now: number): Move[] {
+  if (state.status.phase !== "playing" || now < 0) return [];
+  return collectMoves(state, player, { readyAt: now, now });
+}
+
+// How `player`'s pieces move right now, ignoring cooldowns and the start countdown. The UI uses
+// this to let a cooling piece be selected and its move lined up; the bot uses it to see threats.
+export function getMovesIgnoringCooldown(state: GameState, player: Player, now: number): Move[] {
+  if (state.status.phase !== "playing") return [];
+  return collectMoves(state, player, { now });
+}
+
+export function isReady(piece: Piece, now: number): boolean {
+  return now >= piece.readyAt;
+}
+
+// Milliseconds until the piece may move (0 when it is ready).
+export function cooldownLeft(piece: Piece, now: number): number {
+  return Math.max(0, piece.readyAt - now);
 }
 
 // ---------------------------------------------------------------------------------------------
-// Layer 2: attacks and the check rules
+// Attacks
 // ---------------------------------------------------------------------------------------------
 
-// True when a piece of `byPlayer` attacks `square` (could capture a piece standing there).
-export function isSquareAttacked(
-  state: GameState,
-  square: Square,
-  byPlayer: Player,
-  options: AttackOptions = {}
-): boolean {
+// The pieces of `byPlayer` that attack `square` (could capture a piece standing there), whether
+// or not they are ready.
+export function getAttackers(state: GameState, square: Square, byPlayer: Player): LocatedPiece[] {
   const { row, col } = square;
   const board = state.board;
-  const counts = (piece: Piece, r: number, c: number) =>
-    !options.canAttack || options.canAttack(piece, { row: r, col: c }, state);
+  const found: LocatedPiece[] = [];
 
   for (const [dr, dc] of KNIGHT_OFFSETS) {
     const r = row + dr;
     const c = col + dc;
     if (r < 0 || r >= BOARD_SIZE || c < 0 || c >= BOARD_SIZE) continue;
     const piece = board[r][c];
-    if (piece && piece.player === byPlayer && piece.kind === "knight" && counts(piece, r, c)) return true;
+    if (piece && piece.player === byPlayer && piece.kind === "knight") found.push({ piece, square: { row: r, col: c } });
   }
 
   // A pawn attacks one row ahead of itself, so the attacker sits one row behind the square.
@@ -478,7 +450,7 @@ export function isSquareAttacked(
       const c = col + dc;
       if (c < 0 || c >= BOARD_SIZE) continue;
       const piece = board[pawnRow][c];
-      if (piece && piece.player === byPlayer && piece.kind === "pawn" && counts(piece, pawnRow, c)) return true;
+      if (piece && piece.player === byPlayer && piece.kind === "pawn") found.push({ piece, square: { row: pawnRow, col: c } });
     }
   }
 
@@ -490,11 +462,10 @@ export function isSquareAttacked(
     let distance = 1;
     while (r >= 0 && r < BOARD_SIZE && c >= 0 && c < BOARD_SIZE) {
       const piece = board[r][c];
-      if (piece && !(options.isTransparent && options.isTransparent(piece, { row: r, col: c }, state))) {
+      if (piece) {
         if (piece.player === byPlayer) {
-          const slides =
-            piece.kind === "queen" || (diagonal ? piece.kind === "bishop" : piece.kind === "rook");
-          if ((slides || (distance === 1 && piece.kind === "king")) && counts(piece, r, c)) return true;
+          const slides = piece.kind === "queen" || (diagonal ? piece.kind === "bishop" : piece.kind === "rook");
+          if (slides || (distance === 1 && piece.kind === "king")) found.push({ piece, square: { row: r, col: c } });
         }
         break;
       }
@@ -504,7 +475,13 @@ export function isSquareAttacked(
     }
   }
 
-  return false;
+  return found;
+}
+
+export function isSquareAttacked(state: GameState, square: Square, byPlayer: Player, options: AttackOptions = {}): boolean {
+  const attackers = getAttackers(state, square, byPlayer);
+  if (!options.canAttack) return attackers.length > 0;
+  return attackers.some(({ piece, square: from }) => options.canAttack?.(piece, from, state));
 }
 
 export function findKing(state: GameState, player: Player): Square | null {
@@ -517,54 +494,30 @@ export function findKing(state: GameState, player: Player): Square | null {
   return null;
 }
 
-export function isInCheck(state: GameState, player: Player, options: AttackOptions = variantOptions(state).attacks ?? {}): boolean {
-  const king = findKing(state, player);
-  return king ? isSquareAttacked(state, king, opponentOf(player), options) : false;
-}
-
-// The check rules for one pseudo-legal move: the mover's king may not be attacked afterwards,
-// and a king may not castle out of or through an attacked square.
-export function isLegalMove(state: GameState, move: Move, options: AttackOptions = {}): boolean {
-  const enemy = opponentOf(move.player);
-  if (move.castle) {
-    if (isSquareAttacked(state, move.from, enemy, options)) return false;
-    const transit = { row: move.from.row, col: (move.from.col + move.to.col) / 2 };
-    if (isSquareAttacked(state, transit, enemy, options)) return false;
-  }
-  const next = makeMove(state, move);
-  const king = move.pieceKind === "king" ? move.to : findKing(next, move.player);
-  return king ? !isSquareAttacked(next, king, enemy, options) : true;
-}
-
-// Legal moves for `player`, whatever the game status says. `overrides` is merged over the
-// variant's own options (the bot passes `tacticalOnly`).
-export function generateLegalMoves(
+// UI aid, not a rule: the square of `player`'s king when an enemy piece that attacks it is ready
+// or will be within `soonMs`. Null when the king is safe for now, or the game is not running.
+export function getKingInDanger(
   state: GameState,
-  player: Player = state.currentPlayer,
-  overrides: MoveGenOptions = {}
-): Move[] {
-  const options = variantOptions(state);
-  const pseudo = getPseudoLegalMoves(state, player, { ...options.moves, ...overrides });
-  if (options.checkRules === false) return pseudo;
-  const attacks = options.attacks ?? {};
-  return pseudo.filter((move) => isLegalMove(state, move, attacks));
-}
-
-// The moves the side to move may play. Empty once the game is over.
-export function getLegalMoves(state: GameState, player: Player = state.currentPlayer): Move[] {
-  if (state.status.phase !== "playing") return [];
-  return generateLegalMoves(state, player);
+  player: Player,
+  now: number,
+  soonMs: number = KING_DANGER_SOON_MS
+): Square | null {
+  if (state.status.phase !== "playing" || now < 0) return null;
+  const king = findKing(state, player);
+  if (!king) return null;
+  const threatened = isSquareAttacked(state, king, opponentOf(player), {
+    canAttack: (piece) => piece.readyAt - now <= soonMs
+  });
+  return threatened ? king : null;
 }
 
 // ---------------------------------------------------------------------------------------------
 // Making moves
 // ---------------------------------------------------------------------------------------------
 
-const PLAYING: GameStatus = { phase: "playing", check: false, message: "" };
-
-// Plays a pseudo-legal move with no legality check, no move log, no repetition count and no
-// status. This is the fast path for search (the bot) and for the legality filter itself.
-export function makeMove(state: GameState, move: Move): GameState {
+// Plays a move with no checks, no move log and no status: the board, the cooldowns, the "moved"
+// flags and the en passant mark. The bot uses this to look one move ahead.
+export function makeMove(state: GameState, move: Move, now: number): GameState {
   const board = state.board.slice();
   const touch = (row: number) => {
     if (board[row] === state.board[row]) board[row] = board[row].slice();
@@ -573,6 +526,12 @@ export function makeMove(state: GameState, move: Move): GameState {
   const piece = state.board[from.row][from.col];
   if (!piece) throw new Error(`No piece on ${squareName(from)}`);
 
+  const cooldown = state.rules.cooldownMs;
+  const skipCooldown =
+    (move.captures.length > 0 && !COOLDOWN_AFTER_CAPTURE) || (Boolean(move.promotion) && !COOLDOWN_AFTER_PROMOTION);
+  const readyAt = skipCooldown ? now : now + cooldown;
+  const doubleStep = piece.kind === "pawn" && Math.abs(to.row - from.row) === 2;
+
   touch(from.row);
   board[from.row][from.col] = null;
   for (const capture of move.captures) {
@@ -580,95 +539,82 @@ export function makeMove(state: GameState, move: Move): GameState {
     board[capture.row][capture.col] = null;
   }
   touch(to.row);
-  board[to.row][to.col] = move.promotion ? { ...piece, kind: move.promotion } : piece;
+  board[to.row][to.col] = {
+    ...piece,
+    kind: move.promotion ?? piece.kind,
+    readyAt,
+    moved: true,
+    enPassantUntil: doubleStep ? readyAt : null
+  };
 
   if (move.rook) {
     const rook = board[move.rook.from.row][move.rook.from.col];
     board[move.rook.from.row][move.rook.from.col] = null;
-    board[move.rook.to.row][move.rook.to.col] = rook;
+    board[move.rook.to.row][move.rook.to.col] = rook
+      ? { ...rook, moved: true, readyAt: CASTLING_COOLS_ROOK ? now + cooldown : rook.readyAt }
+      : null;
   }
 
-  let castling = state.castling;
-  const loseRight = (player: Player, side: "kingSide" | "queenSide") => {
-    if (!castling[player][side]) return;
-    castling = { ...castling, [player]: { ...castling[player], [side]: false } };
-  };
-  if (piece.kind === "king") {
-    loseRight(piece.player, "kingSide");
-    loseRight(piece.player, "queenSide");
-  }
-  // A rook leaving its corner, or anything landing on a corner, ends castling on that side.
-  for (const square of [from, to]) {
-    if (square.col !== 0 && square.col !== BOARD_SIZE - 1) continue;
-    const owner: Player | null = square.row === BOARD_SIZE - 1 ? "white" : square.row === 0 ? "black" : null;
-    if (owner) loseRight(owner, square.col === 0 ? "queenSide" : "kingSide");
-  }
-
-  const doublePush = piece.kind === "pawn" && Math.abs(to.row - from.row) === 2;
-  const irreversible = piece.kind === "pawn" || move.captures.length > 0;
-
-  return {
-    ...state,
-    board,
-    castling,
-    currentPlayer: opponentOf(move.player),
-    enPassant: doublePush ? { row: (from.row + to.row) / 2, col: from.col } : null,
-    halfmoveClock: irreversible ? 0 : state.halfmoveClock + 1,
-    fullmoveNumber: state.fullmoveNumber + (move.player === "black" ? 1 : 0),
-    status: PLAYING
-  };
+  return { ...state, board };
 }
 
-// Plays one legal move for the side to move and returns the new state (the input is not changed).
-export function applyMove(state: GameState, moveId: string): GameState {
-  const legalMoves = getLegalMoves(state);
-  const move = legalMoves.find((candidate) => candidate.id === moveId);
-  if (!move) throw new Error(`Illegal move: ${moveId}`);
+// Tries to play `moveId` for `player` at game time `now`. Never throws: an input that is not
+// legal at that instant comes back with the reason, and the state is unchanged.
+export function tryMove(state: GameState, player: Player, moveId: string, now: number): MoveResult {
+  if (state.status.phase !== "playing") return { ok: false, reason: "game-over" };
+  if (now < 0) return { ok: false, reason: "not-started" };
+
+  let from: Square;
+  try {
+    from = parseSquare(String(moveId).slice(0, 2));
+  } catch {
+    return { ok: false, reason: "illegal" };
+  }
+  const piece = state.board[from.row][from.col];
+  if (!piece || piece.player !== player) return { ok: false, reason: "no-piece" };
+  if (!isReady(piece, now)) return { ok: false, reason: "cooling", readyInMs: piece.readyAt - now };
+
+  const pieceMoves: Move[] = [];
+  addPieceMoves(state, piece, from.row, from.col, { readyAt: now, now }, pieceMoves);
+  const move = pieceMoves.find((candidate) => candidate.id === moveId);
+  if (!move) return { ok: false, reason: "illegal" };
 
   const captured = move.captures
     .map((capture) => state.board[capture.row][capture.col]?.kind)
     .filter((kind): kind is PieceKind => Boolean(kind));
 
-  const moved = makeMove(state, move);
-  const irreversible = move.pieceKind === "pawn" || captured.length > 0;
-  const key = positionKey(moved);
-  const positionCounts = irreversible
-    ? { [key]: 1 }
-    : { ...state.positionCounts, [key]: (state.positionCounts[key] ?? 0) + 1 };
-
-  const next: GameState = { ...moved, positionCounts };
-  const status = evaluateStatus(next);
-  const check = status.phase === "playing" ? status.check : status.phase === "won";
-  const suffix = status.phase === "won" ? "#" : check ? "+" : "";
-
   const entry: MoveLogEntry = {
-    turn: state.fullmoveNumber,
-    player: move.player,
+    at: now,
+    player,
     pieceId: move.pieceId,
     pieceKind: move.pieceKind,
     from: move.from,
     to: move.to,
     captured,
-    notation: sanWithoutSuffix(move, legalMoves) + suffix,
-    check
+    notation: notationFor(state, move, now)
   };
   if (move.promotion) entry.promotion = move.promotion;
   if (move.rook) entry.rook = move.rook;
 
-  return { ...next, moveLog: [...state.moveLog, entry], status };
+  const moved = makeMove(state, move, now);
+  const next: GameState = { ...moved, moveLog: [...state.moveLog, entry] };
+  return { ok: true, state: { ...next, status: evaluateStatus(next) }, move };
 }
 
-export function resignGame(state: GameState, player: Player = state.currentPlayer): GameState {
+// Plays one move and returns the new state (the input is not changed). Throws when the move is
+// not legal for `player` at `now`; use tryMove to get the reason instead.
+export function applyMove(state: GameState, player: Player, moveId: string, now: number): GameState {
+  const result = tryMove(state, player, moveId, now);
+  if (!result.ok) throw new Error(`Illegal move ${moveId}: ${result.reason}`);
+  return result.state;
+}
+
+export function resignGame(state: GameState, player: Player): GameState {
   if (state.status.phase !== "playing") return state;
   const winner = opponentOf(player);
   return {
     ...state,
-    status: {
-      phase: "won",
-      winner,
-      reason: "resignation",
-      message: `${playerName(winner)} wins by resignation`
-    }
+    status: { phase: "won", winner, reason: "resignation", message: `${playerName(winner)} wins by resignation` }
   };
 }
 
@@ -676,85 +622,48 @@ export function isGameOver(state: GameState): boolean {
   return state.status.phase !== "playing";
 }
 
+// What a player is told when their move was refused.
+export function describeReject(reason: RejectReason, readyInMs = 0): string {
+  switch (reason) {
+    case "game-over":
+      return "That game is already over.";
+    case "not-started":
+      return "Wait for the countdown.";
+    case "no-piece":
+      return "That piece is gone.";
+    case "cooling":
+      return `Still cooling down: ${(Math.max(0, readyInMs) / 1000).toFixed(1)} s`;
+    case "illegal":
+      return "That move is no longer possible.";
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Status
 // ---------------------------------------------------------------------------------------------
 
 export function evaluateStatus(state: GameState): GameStatus {
-  const player = state.currentPlayer;
-  const options = variantOptions(state);
-  const check = options.checkRules === false ? false : isInCheck(state, player, options.attacks ?? {});
-  const hasMove = generateLegalMoves(state, player).length > 0;
-
-  if (!hasMove && check) {
-    const winner = opponentOf(player);
-    return { phase: "won", winner, reason: "checkmate", message: `Checkmate. ${playerName(winner)} wins` };
-  }
-  if (!hasMove) {
-    return { phase: "draw", reason: "stalemate", message: `Draw by stalemate: ${playerName(player)} has no legal move` };
-  }
-  if (hasInsufficientMaterial(state)) {
-    return { phase: "draw", reason: "insufficient-material", message: "Draw: neither side has enough material to checkmate" };
-  }
-  if ((state.positionCounts[positionKey(state)] ?? 0) >= 3) {
-    return { phase: "draw", reason: "threefold-repetition", message: "Draw by threefold repetition" };
-  }
-  if (state.halfmoveClock >= 100) {
-    return { phase: "draw", reason: "fifty-move", message: "Draw by the fifty-move rule" };
-  }
-  return {
-    phase: "playing",
-    check,
-    message: check ? `${playerName(player)} is in check` : `${playerName(player)} to move`
-  };
-}
-
-// King against king, king and one minor piece against king, or only bishops that all stand on
-// the same colour.
-export function hasInsufficientMaterial(state: GameState): boolean {
-  let knights = 0;
-  let lightBishops = 0;
-  let darkBishops = 0;
-  for (let row = 0; row < BOARD_SIZE; row += 1) {
-    for (let col = 0; col < BOARD_SIZE; col += 1) {
-      const piece = state.board[row][col];
-      if (!piece || piece.kind === "king") continue;
-      if (piece.kind === "knight") knights += 1;
-      else if (piece.kind === "bishop") {
-        if (isDarkSquare({ row, col })) darkBishops += 1;
-        else lightBishops += 1;
-      } else return false;
+  let whiteKing = false;
+  let blackKing = false;
+  let others = 0;
+  for (const row of state.board) {
+    for (const piece of row) {
+      if (!piece) continue;
+      if (piece.kind !== "king") others += 1;
+      else if (piece.player === "white") whiteKing = true;
+      else blackKing = true;
     }
   }
-  if (knights === 0) return lightBishops === 0 || darkBishops === 0;
-  return knights === 1 && lightBishops + darkBishops === 0;
-}
-
-// Identifies a position for repetition: placement, side to move, castling rights and the
-// en passant square when a capture there is actually possible.
-export function positionKey(state: GameState): string {
-  let key = "";
-  for (let row = 0; row < BOARD_SIZE; row += 1) {
-    for (let col = 0; col < BOARD_SIZE; col += 1) {
-      const piece = state.board[row][col];
-      if (!piece) key += ".";
-      else key += piece.player === "white" ? KIND_LETTERS[piece.kind].toUpperCase() : KIND_LETTERS[piece.kind];
-    }
+  if (!whiteKing || !blackKing) {
+    // Positions built for tests may lack a king on both sides; that is simply still "playing".
+    if (!whiteKing && !blackKing) return PLAYING;
+    const winner: Player = whiteKing ? "white" : "black";
+    return { phase: "won", winner, reason: "king-captured", message: `King captured. ${playerName(winner)} wins` };
   }
-  key += state.currentPlayer === "white" ? " w " : " b ";
-  key += castlingText(state.castling);
-  if (state.enPassant) {
-    const { row, col } = state.enPassant;
-    const pawnRow = row - pawnDirection(state.currentPlayer);
-    for (const dc of [-1, 1]) {
-      const piece = state.board[pawnRow]?.[col + dc];
-      if (piece && piece.kind === "pawn" && piece.player === state.currentPlayer) {
-        key += ` ${SQUARE_NAMES[row][col]}`;
-        break;
-      }
-    }
+  if (DRAW_ON_BARE_KINGS && others === 0) {
+    return { phase: "draw", reason: "bare-kings", message: "Draw: only the two kings are left" };
   }
-  return key;
+  return PLAYING;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -763,7 +672,7 @@ export function positionKey(state: GameState): string {
 
 const SAN_LETTERS: Record<PieceKind, string> = { pawn: "", knight: "N", bishop: "B", rook: "R", queen: "Q", king: "K" };
 
-function sanWithoutSuffix(move: Move, legalMoves: Move[]): string {
+function notationFor(state: GameState, move: Move, now: number): string {
   if (move.castle) return move.castle === "king" ? "O-O" : "O-O-O";
 
   const capture = move.captures.length > 0;
@@ -775,9 +684,9 @@ function sanWithoutSuffix(move: Move, legalMoves: Move[]): string {
     return `${capture ? `${fromName[0]}x` : ""}${destination}${promotion}`;
   }
 
-  // Disambiguate when another piece of the same kind could also reach the square:
-  // by file if that is enough, otherwise by rank, otherwise by both.
-  const rivals = legalMoves.filter(
+  // Disambiguate when another piece of the same kind could also reach the square (ready or
+  // not): by file if that is enough, otherwise by rank, otherwise by both.
+  const rivals = collectMoves(state, move.player, { now }).filter(
     (other) =>
       other.pieceId !== move.pieceId &&
       other.pieceKind === move.pieceKind &&
@@ -791,19 +700,6 @@ function sanWithoutSuffix(move: Move, legalMoves: Move[]): string {
     else origin = fromName;
   }
   return `${SAN_LETTERS[move.pieceKind]}${origin}${capture ? "x" : ""}${destination}`;
-}
-
-// The SAN text a legal move would be logged with, without playing it.
-export function moveToSan(state: GameState, moveId: string): string {
-  const next = applyMove(state, moveId);
-  return next.moveLog[next.moveLog.length - 1].notation;
-}
-
-// Finds the legal move written as `san` ("Nf3", "exd5", "O-O", "e8=Q"; check marks optional).
-export function findMoveBySan(state: GameState, san: string): Move | null {
-  const wanted = san.replace(/[+#!?]/g, "");
-  const legalMoves = getLegalMoves(state);
-  return legalMoves.find((move) => sanWithoutSuffix(move, legalMoves) === wanted) ?? null;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -825,12 +721,15 @@ export function findPiece(state: GameState, pieceId: string): LocatedPiece | nul
   return null;
 }
 
-// The square of a king that is in check or checkmated, for the board highlight.
-export function getCheckedKingSquare(state: GameState): Square | null {
-  const { status } = state;
-  if (status.phase === "playing" && status.check) return findKing(state, state.currentPlayer);
-  if (status.phase === "won" && status.reason === "checkmate") return findKing(state, opponentOf(status.winner));
-  return null;
+export function listPieces(state: GameState, player?: Player): LocatedPiece[] {
+  const pieces: LocatedPiece[] = [];
+  for (let row = 0; row < BOARD_SIZE; row += 1) {
+    for (let col = 0; col < BOARD_SIZE; col += 1) {
+      const piece = state.board[row][col];
+      if (piece && (!player || piece.player === player)) pieces.push({ piece, square: { row, col } });
+    }
+  }
+  return pieces;
 }
 
 export function isDarkSquare(square: Square): boolean {
@@ -849,7 +748,7 @@ export function parseSquare(name: string): Square {
   const col = name.charCodeAt(0) - 97;
   const row = BOARD_SIZE - Number(name.slice(1));
   const square = { row, col };
-  if (!isInside(square)) throw new Error(`Invalid square: ${name}`);
+  if (!Number.isInteger(row) || !isInside(square)) throw new Error(`Invalid square: ${name}`);
   return square;
 }
 
@@ -890,25 +789,6 @@ export function getMaterial(state: GameState): Material {
   const captured: Record<Player, PieceKind[]> = { white: [], black: [] };
   for (const entry of state.moveLog) captured[entry.player].push(...entry.captured);
   return { score, captured };
-}
-
-// Counts the leaf positions `depth` moves deep. The standard move-generator correctness test.
-export function perft(state: GameState, depth: number): number {
-  if (depth === 0) return 1;
-  const moves = generateLegalMoves(state);
-  if (depth === 1) return moves.length;
-  let nodes = 0;
-  for (const move of moves) nodes += perft(makeMove(state, move), depth - 1);
-  return nodes;
-}
-
-function castlingText(castling: CastlingRights): string {
-  const text =
-    (castling.white.kingSide ? "K" : "") +
-    (castling.white.queenSide ? "Q" : "") +
-    (castling.black.kingSide ? "k" : "") +
-    (castling.black.queenSide ? "q" : "");
-  return text || "-";
 }
 
 function createEmptyBoard(): (Piece | null)[][] {
