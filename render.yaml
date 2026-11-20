@@ -1,7 +1,6 @@
 services:
   - type: web
-    # CHANGE-ME: each game names its own Render service.
-    name: CHANGE-ME-game-server
+    name: cooldown-chess-server
     runtime: node
     plan: free
     buildCommand: npm ci
@@ -13,5 +12,5 @@ services:
         value: 0.0.0.0
       - key: CLIENT_ORIGINS
         # capacitor://localhost and https://localhost are the iOS and Android app shells.
-        # CHANGE-ME: replace the first origin with the game's web URL.
-        value: https://CHANGE-ME.example,capacitor://localhost,https://localhost
+        # LIVE_URL_PLACEHOLDER: replace the first origin with the game's web URL when it is published.
+        value: https://cooldown-chess.example,capacitor://localhost,https://localhost

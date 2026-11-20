@@ -20,15 +20,11 @@ import {
 } from "lucide-react";
 import {
   DEFAULT_GAME_RULES,
-  getLegalMoves,
-  getPieceAt,
   opponentOf,
   playerName,
   type GameRules,
-  type GameState,
   type Move,
-  type Player,
-  type Square
+  type Player
 } from "../game";
 import {
   QUICK_CHAT_MESSAGES,
@@ -43,18 +39,20 @@ import { withoutFreeText } from "../multiplayer/nativeSafety";
 import { getMultiplayerSocket } from "../multiplayer/socket";
 import { type BotLevel } from "../bot";
 import { getPlayerIdentity } from "../playerIdentity";
-import { playSound, soundForMove } from "../sound";
-import { Board, groupMovesByPiece, moveAnimation, movesTo } from "../ui/Board";
+import { playSound } from "../sound";
+import { Board } from "../ui/Board";
 import { BotLevelPicker } from "../ui/BotLevelPicker";
 import { ColorPicker, resolveColorChoice } from "../ui/ColorPicker";
-import { MoveList, PlayerBar, RulesDialog, SoundToggle, TurnStatus } from "../ui/GameChrome";
-import { resultTitle } from "../ui/GameOverDialog";
+import { CooldownPicker, MoveFeed, PlayerBar, RulesDialog, SoundToggle, StartCountdown, StatusBar, cooldownLabel } from "../ui/GameChrome";
+import { resultDetail, resultTitle } from "../ui/GameOverDialog";
 import { Modal } from "../ui/Modal";
-import { pieceSprite, type PieceAnimation } from "../ui/PieceToken";
-import { PromotionPicker } from "../ui/PromotionPicker";
+import { pieceSprite } from "../ui/PieceToken";
+import { useClockTick, useGameSounds, useKingDanger, useMoveEffects, useSelections, type ClockView } from "../ui/realtime";
 import { LocalGamePage } from "./LocalGamePage";
 
-const SESSION_KEY = "chess-base:online-session:v1";
+const SESSION_KEY = "cooldown-chess:online-session:v1";
+const WHITE_ONLY: readonly Player[] = ["white"];
+const BLACK_ONLY: readonly Player[] = ["black"];
 
 type LobbyMode = "create" | "join";
 type GameDialog = "rules" | "resign" | "leave" | null;
@@ -286,6 +284,7 @@ export function MultiplayerPage({
       connected={connected}
       busy={busy}
       queued={queued}
+      queueRules={queueRules}
       error={error}
       onExit={onExit}
       onCreate={createRoom}
@@ -317,6 +316,7 @@ function MultiplayerLobby({
   connected,
   busy,
   queued,
+  queueRules,
   error,
   onExit,
   onCreate,
@@ -330,6 +330,7 @@ function MultiplayerLobby({
   connected: boolean;
   busy: boolean;
   queued: boolean;
+  queueRules: GameRules;
   error: string | null;
   onExit: () => void;
   onCreate: (rules: GameRules, color: ColorChoice) => void;
@@ -341,8 +342,8 @@ function MultiplayerLobby({
 }) {
   const [mode, setMode] = useState<LobbyMode>("create");
   const [code, setCode] = useState("");
-  // Plain chess has no rule options. A variant keeps its options in state here.
-  const rules = DEFAULT_GAME_RULES;
+  // The cooldown for a room this player creates, and the one quick match searches for.
+  const [rules, setRules] = useState<GameRules>(DEFAULT_GAME_RULES);
   const [botLevel, setBotLevel] = useState<BotLevel>("medium");
   const [roomColor, setRoomColor] = useState<ColorChoice>("random");
   const [botColor, setBotColor] = useState<ColorChoice>("white");
@@ -365,7 +366,7 @@ function MultiplayerLobby({
           </div>
           <p className="section-kicker">Quick match</p>
           <h1>Looking for a player</h1>
-          <p>You will be matched with the next player who searches.</p>
+          <p>You will be matched with the next player who searches for a game with a {cooldownLabel(queueRules)}.</p>
           <div className="queue-bot">
             <strong>Play a bot meanwhile?</strong>
             <BotLevelPicker value={botLevel} onChange={setBotLevel} />
@@ -413,6 +414,11 @@ function MultiplayerLobby({
         </p>
 
         {error ? <p className="lobby-error" role="alert">{error}</p> : null}
+
+        <div className="lobby-setting">
+          <CooldownPicker value={rules} onChange={setRules} />
+          <small>Used for the room you create and for quick match. A room you join uses its host's choice.</small>
+        </div>
 
         <div className="lobby-cards">
           <div className="lobby-card">
@@ -472,7 +478,7 @@ function MultiplayerLobby({
               <Zap aria-hidden="true" size={18} />
               <h2>Quick match</h2>
             </div>
-            <p>Pair with the next player who searches. Sides are random, and you can play a bot while you wait.</p>
+            <p>Pair with the next player searching for the same cooldown. Sides are random, and you can play a bot while you wait.</p>
             <button
               className="button secondary"
               type="button"
@@ -527,7 +533,7 @@ function WaitingRoom({
       <section className="waiting-room" aria-labelledby="waiting-title">
         <p className="section-kicker">Private room</p>
         <h1 id="waiting-title">Waiting for an opponent</h1>
-        <p className="waiting-copy">Share this code with your opponent. They choose Join room and enter it. You play {ownSide}.</p>
+        <p className="waiting-copy">Share this code with your opponent. They choose Join room and enter it. You play {ownSide}, with a {cooldownLabel(snapshot.rules)}.</p>
 
         <button className="room-code-display" type="button" onClick={copyCode} title="Copy room code">
           <span>{snapshot.code}</span>
@@ -560,6 +566,70 @@ function WaitingSeat({ player, name, connected }: { player: Player; name: string
   );
 }
 
+// How often the client asks the server for its time, and how small a correction is ignored.
+const CLOCK_SYNC_EVERY_MS = 4000;
+const CLOCK_SYNC_SAMPLES = 5;
+const CLOCK_JITTER_MS = 25;
+// A move refused as "cooling" with this little left was only the two clocks disagreeing: resend it.
+const RETRY_WITHIN_MS = 250;
+
+// The room's game clock as this client sees it. Every snapshot carries the clock's value and the
+// server's wall time; the offset between the server's wall clock and ours is measured with
+// small ping/pong requests (the reply is assumed to have been sent halfway through the round
+// trip, and the quickest of the last few round trips is trusted most).
+function useServerClock(snapshot: RoomSnapshot, connected: boolean): ClockView {
+  const socket = useMemo(getMultiplayerSocket, []);
+  // Until the first ping returns, assume the snapshot arrived instantly. That estimate is late
+  // by the network delay, which only ever makes this client a little slow, never early.
+  const offsetRef = useRef<number | null>(null);
+  if (offsetRef.current === null) offsetRef.current = snapshot.serverTime - Date.now();
+  const samples = useRef<{ rtt: number; offset: number }[]>([]);
+  const [epoch, setEpoch] = useState(0);
+
+  useEffect(() => {
+    if (!connected) return;
+    let cancelled = false;
+    const ping = () => {
+      const sentAt = Date.now();
+      socket.emit("clock:sync", (serverTime) => {
+        if (cancelled || typeof serverTime !== "number") return;
+        const receivedAt = Date.now();
+        samples.current = [...samples.current, { rtt: receivedAt - sentAt, offset: serverTime - (sentAt + receivedAt) / 2 }].slice(-CLOCK_SYNC_SAMPLES);
+        const best = samples.current.reduce((a, b) => (b.rtt < a.rtt ? b : a));
+        if (Math.abs(best.offset - (offsetRef.current ?? 0)) > CLOCK_JITTER_MS) {
+          offsetRef.current = best.offset;
+          // Restart the cooldown rings from the corrected clock.
+          setEpoch((current) => current + 1);
+        }
+      });
+    };
+    ping();
+    const fast = window.setTimeout(ping, 600);
+    const timer = window.setInterval(ping, CLOCK_SYNC_EVERY_MS);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(fast);
+      window.clearInterval(timer);
+    };
+  }, [connected, socket]);
+
+  const { value, running: serverRunning } = snapshot.clock;
+  const { serverTime } = snapshot;
+  // Without a connection nothing can be trusted to be advancing; hold the picture still.
+  const running = serverRunning && connected;
+  const frozenAt = useRef(value);
+  return useMemo(() => {
+    const now = () => {
+      if (!serverRunning) return value;
+      if (!connected) return frozenAt.current;
+      const current = value + Math.max(0, Date.now() + (offsetRef.current ?? 0) - serverTime);
+      frozenAt.current = current;
+      return current;
+    };
+    return { now, running, epoch: epoch * 4 + (running ? 1 : 0) + (connected ? 2 : 0) };
+  }, [value, serverTime, serverRunning, connected, running, epoch]);
+}
+
 function OnlineGame({
   snapshot,
   session,
@@ -575,85 +645,27 @@ function OnlineGame({
   onError: (message: string | null) => void;
   onLeave: () => void;
 }) {
-  const [selectedPieceId, setSelectedPieceId] = useState<string | null>(null);
-  const [pieceAnimation, setPieceAnimation] = useState<PieceAnimation | null>(null);
-  const [displayState, setDisplayState] = useState(snapshot.game);
   const [dialog, setDialog] = useState<GameDialog>(null);
-  // The promotion moves waiting for the player to pick a piece.
-  const [promotion, setPromotion] = useState<Move[] | null>(null);
-  const latestStateRef = useRef(snapshot.game);
-  const animationIdRef = useRef<number | null>(null);
-  const animationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const socket = useMemo(getMultiplayerSocket, []);
   const state = snapshot.game;
-  const legalMoves = useMemo(
-    () => !pieceAnimation && state.status.phase === "playing" && state.currentPlayer === session.player ? getLegalMoves(state) : [],
-    [pieceAnimation, session.player, state]
-  );
-  const movesByPiece = useMemo(() => groupMovesByPiece(legalMoves), [legalMoves]);
-  const selectedMoves = selectedPieceId ? movesByPiece.get(selectedPieceId) ?? [] : [];
-  const opponent = opponentOf(session.player);
+  const you = session.player;
+  const opponent = opponentOf(you);
   const opponentConnected = snapshot.players[opponent]?.connected ?? false;
   const playing = state.status.phase === "playing";
-  const phase = state.status.phase;
-  const winner = state.status.phase === "won" ? state.status.winner : null;
+  const sides = you === "white" ? WHITE_ONLY : BLACK_ONLY;
 
+  const clock = useServerClock(snapshot, connected);
+  const now = useClockTick(state, clock);
+  const { animations, onAnimationEnd } = useMoveEffects(state, you);
+  const dangerSquares = useKingDanger(state, now, sides);
+  useGameSounds(state, now, you);
+
+  // An error from a refused request clears itself; the game does not stop to be read.
   useEffect(() => {
-    if (selectedPieceId && !movesByPiece.has(selectedPieceId)) setSelectedPieceId(null);
-  }, [movesByPiece, selectedPieceId]);
-
-  // A promotion choice is void once it is no longer this player's move.
-  useEffect(() => {
-    if (legalMoves.length === 0) setPromotion(null);
-  }, [legalMoves]);
-
-  const finishPieceAnimation = useCallback((animationId: number) => {
-    if (animationIdRef.current !== animationId) return;
-    if (animationTimerRef.current) clearTimeout(animationTimerRef.current);
-    animationTimerRef.current = null;
-    animationIdRef.current = null;
-    setPieceAnimation(null);
-    setDisplayState(latestStateRef.current);
-  }, []);
-
-  // The server's state arrives one move ahead of what is drawn; animate the piece there first.
-  useEffect(() => {
-    latestStateRef.current = state;
-    if (animationIdRef.current !== null) return;
-
-    const displayedMoves = displayState.moveLog.length;
-    if (state.moveLog.length === displayedMoves + 1) {
-      const entry = state.moveLog[state.moveLog.length - 1];
-      const movingPiece = getPieceAt(displayState, entry.from);
-      if (movingPiece) {
-        const animation = moveAnimation(entry, {
-          id: snapshot.revision,
-          pieceId: movingPiece.id,
-          perspective: session.player,
-          direction: "to"
-        });
-        animationIdRef.current = animation.id;
-        setPieceAnimation(animation);
-        playSound(soundForMove(entry));
-        animationTimerRef.current = setTimeout(
-          () => finishPieceAnimation(animation.id),
-          600
-        );
-        return;
-      }
-    }
-
-    if (displayState !== state) setDisplayState(state);
-  }, [displayState, finishPieceAnimation, session.player, snapshot.revision, state]);
-
-  useEffect(() => () => {
-    if (animationTimerRef.current) clearTimeout(animationTimerRef.current);
-  }, []);
-
-  useEffect(() => {
-    if (phase === "draw") playSound("draw");
-    if (phase === "won") playSound(winner === session.player ? "win" : "lose");
-  }, [phase, winner, session.player]);
+    if (!error) return;
+    const timer = window.setTimeout(() => onError(null), 2600);
+    return () => window.clearTimeout(timer);
+  }, [error, onError]);
 
   function request(
     action: (ack: (response: ServerResponse<null>) => void) => void,
@@ -674,38 +686,49 @@ function OnlineGame({
     });
   }
 
-  function playMove(move: Move) {
-    setPromotion(null);
-    setSelectedPieceId(null);
-    request((ack) => socket.emit("room:move", move.id, ack));
-  }
+  const notifyRef = useRef<(pieceId: string, text: string) => void>(() => undefined);
 
-  function handleSquareClick(square: Square) {
-    if (pieceAnimation || !connected || !opponentConnected || !playing || state.currentPlayer !== session.player) return;
+  // Sends a move intent. The server decides: it stamps the intent with its own clock when it
+  // arrives and either applies it (the new state comes back as a snapshot) or says why not.
+  const sendMove = useCallback(
+    (_player: Player, move: Move, retried = false) => {
+      socket.emit("room:move", move.id, (response) => {
+        if (response.ok) return;
+        if (response.reason === "cooling") {
+          const left = response.readyInMs ?? 0;
+          if (!retried && left <= RETRY_WITHIN_MS) {
+            window.setTimeout(() => sendMove(_player, move, true), left + 15);
+            return;
+          }
+          notifyRef.current(move.pieceId, `${(left / 1000).toFixed(1)}s`);
+          playSound("deny");
+          return;
+        }
+        if (response.reason === "no-piece" || response.reason === "illegal") {
+          playSound("deny");
+          onError("Too late: the board changed before your move arrived.");
+          return;
+        }
+        onError(response.message);
+      });
+    },
+    [onError, socket]
+  );
 
-    const destinationMoves = movesTo(selectedMoves, square);
-    if (destinationMoves.length > 1) {
-      setPromotion(destinationMoves);
-      return;
-    }
-    if (destinationMoves.length === 1) {
-      playMove(destinationMoves[0]);
-      return;
-    }
+  const { selections, notices, notify, onSquareDown, onSquareUp } = useSelections({
+    state,
+    now,
+    clock,
+    sides,
+    enabled: playing && connected && opponentConnected,
+    onMove: sendMove
+  });
+  notifyRef.current = notify;
 
-    const piece = getPieceAt(displayState, square);
-    if (piece?.player === session.player && movesByPiece.has(piece.id)) {
-      setSelectedPieceId(piece.id === selectedPieceId ? null : piece.id);
-      return;
-    }
-
-    setSelectedPieceId(null);
-  }
-
-  const statusMessage = getOnlineStatusMessage(state, session.player, connected, opponentConnected);
-  const ownRematchVote = snapshot.rematchVotes.includes(session.player);
+  const ownRematchVote = snapshot.rematchVotes.includes(you);
   const opponentRematchVote = snapshot.rematchVotes.includes(opponent);
-  const opponentName = snapshot.players[opponent]?.name ?? playerName(opponent);
+  const paused = playing && (!connected || !opponentConnected);
+  const live = playing && !paused && now >= 0;
 
   function requestRematch() {
     request((ack) => socket.emit("room:rematch", ack));
@@ -713,35 +736,42 @@ function OnlineGame({
 
   return (
     <main className="game-page online-game-page">
-      <section className="game-workspace" aria-label="Online chess game">
+      <section className="game-workspace" aria-label="Online game">
         <div className="board-column">
           <PlayerBar
             player={opponent}
             name={snapshot.players[opponent]?.name ?? "Open seat"}
             tag={playerName(opponent)}
             state={state}
-            active={playing && state.currentPlayer === opponent}
+            now={now}
+            live={live}
             offline={!opponentConnected}
           />
 
           <Board
-            state={displayState}
-            perspective={session.player}
-            label={`Chess board, ${playerName(session.player)} side`}
-            selectedPieceId={selectedPieceId}
-            targets={selectedMoves}
-            movablePieceIds={movesByPiece}
-            animation={pieceAnimation}
-            onAnimationEnd={finishPieceAnimation}
-            onSquareClick={handleSquareClick}
+            state={state}
+            perspective={you}
+            label={`Chess board, ${playerName(you)} side`}
+            now={now}
+            clock={clock}
+            selections={selections}
+            sides={sides}
+            animations={animations}
+            onAnimationEnd={onAnimationEnd}
+            onSquareDown={onSquareDown}
+            onSquareUp={onSquareUp}
+            dangerSquares={dangerSquares}
+            notices={notices}
+            overlay={paused ? null : <StartCountdown state={state} now={now} paused={false} />}
           />
 
           <PlayerBar
-            player={session.player}
-            name={snapshot.players[session.player]?.name ?? "You"}
-            tag={`You · ${playerName(session.player)}`}
+            player={you}
+            name={snapshot.players[you]?.name ?? "You"}
+            tag={`You · ${playerName(you)}`}
             state={state}
-            active={playing && state.currentPlayer === session.player}
+            now={now}
+            live={live}
             offline={!connected}
           />
 
@@ -754,13 +784,13 @@ function OnlineGame({
           />
         </div>
 
-        <aside className="game-panel" aria-label="Online game controls and move history">
+        <aside className="game-panel" aria-label="Online game controls and move feed">
           <header className="game-panel-header">
             <button className="icon-button" type="button" onClick={() => setDialog("leave")} aria-label="Leave game" title="Leave game">
               <Home aria-hidden="true" size={19} />
             </button>
             <div>
-              <p className="section-kicker">Room {snapshot.code}</p>
+              <p className="section-kicker">Room {snapshot.code} · {cooldownLabel(snapshot.rules)}</p>
               <strong>Online match</strong>
             </div>
             <SoundToggle />
@@ -769,13 +799,21 @@ function OnlineGame({
             </span>
           </header>
 
-          <TurnStatus
+          <StatusBar
             state={state}
-            title={!playing ? "Game over" : state.currentPlayer === session.player ? "Your move" : `${opponentName} to move`}
-            message={statusMessage}
+            now={now}
+            paused={paused}
+            danger={dangerSquares.length > 0}
+            message={
+              !connected
+                ? "Reconnecting to the game server..."
+                : playing && !opponentConnected
+                  ? "Waiting for your opponent to reconnect. Every cooldown is frozen."
+                  : undefined
+            }
           />
 
-          <MoveList state={state} />
+          <MoveFeed state={state} />
 
           <ChatPanel
             snapshot={snapshot}
@@ -819,12 +857,8 @@ function OnlineGame({
 
       {dialog === "rules" ? <RulesDialog onClose={() => setDialog(null)} /> : null}
 
-      {promotion && dialog === null ? (
-        <PromotionPicker moves={promotion} onPick={playMove} onCancel={() => setPromotion(null)} />
-      ) : null}
-
       {dialog === "resign" ? (
-        <Modal title="Resign this game?" description="Your opponent will win the current match." tone="danger" onClose={() => setDialog(null)}>
+        <Modal title="Resign this game?" description="Your opponent will win the current match. The game keeps running while this is open." tone="danger" onClose={() => setDialog(null)}>
           <div className="modal-actions">
             <button className="button secondary" type="button" onClick={() => setDialog(null)}>Cancel</button>
             <button className="button danger" type="button" data-autofocus onClick={() => { setDialog(null); request((ack) => socket.emit("room:resign", ack)); }}>Resign</button>
@@ -886,7 +920,7 @@ function GameEventOverlay({
           {serverOffline || disconnectSeconds === null ? null : (
             <strong className="disconnect-countdown" aria-label={`${disconnectSeconds} seconds remaining`}>{disconnectSeconds}</strong>
           )}
-          <p>{serverOffline ? "Reconnecting to the game server..." : `Their seat is being held for ${disconnectSeconds ?? 30} seconds. If they do not reconnect, the match ends by resignation.`}</p>
+          <p>{serverOffline ? "Reconnecting to the game server..." : `Every cooldown is frozen. Their seat is being held for ${disconnectSeconds ?? 30} seconds; if they do not reconnect, they forfeit.`}</p>
           <button className="button secondary" type="button" onClick={onLeave}>Leave room</button>
         </section>
       </div>
@@ -900,6 +934,7 @@ function GameEventOverlay({
   const drawn = state.status.phase === "draw";
   const didWin = state.status.phase === "won" && state.status.winner === session.player;
   const resigned = state.status.phase === "won" && state.status.reason === "resignation";
+  const kingCaptured = state.status.phase === "won" && state.status.reason === "king-captured";
   const opponentLeft = didWin && resigned && !opponentConnected;
   const resultLabel = drawn ? "Draw" : didWin ? "Victory" : "Defeat";
   const outcomeTitle = drawn
@@ -910,9 +945,11 @@ function GameEventOverlay({
         ? didWin
           ? `${opponentName} resigned`
           : "You resigned"
-        : didWin
-          ? "You won"
-          : `${opponentName} won`;
+        : kingCaptured
+          ? resultTitle(state, session.player)
+          : didWin
+            ? "You won"
+            : `${opponentName} won`;
   const title = ownRematchVote
     ? "Rematch requested"
     : opponentRematchVote
@@ -921,8 +958,8 @@ function GameEventOverlay({
   const description = ownRematchVote
     ? `Waiting for ${opponentName} to accept.`
     : opponentRematchVote
-      ? "Accept to reset the board and play again with the same rules."
-      : state.status.message;
+      ? "Accept to reset the board and play again with the same cooldown."
+      : resultDetail(state, session.player);
 
   return (
     <div className="game-event-layer" role="status" aria-live="assertive">
@@ -1027,15 +1064,6 @@ function ConnectionScreen({ label }: { label: string }) {
       </section>
     </main>
   );
-}
-
-function getOnlineStatusMessage(state: GameState, player: Player, connected: boolean, opponentConnected: boolean) {
-  if (!connected) return "Reconnecting to the game server...";
-  if (!opponentConnected) return "Waiting for your opponent to reconnect.";
-  if (state.status.phase !== "playing") return state.status.message;
-  if (state.currentPlayer !== player) return state.status.check ? "Check! Waiting for your opponent." : "Waiting for your opponent.";
-  if (state.status.check) return "You are in check. Get your king to safety.";
-  return "Select a piece to make a move.";
 }
 
 function normalizeRoomCode(code: string) {

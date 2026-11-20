@@ -18,13 +18,13 @@ const names = wanted.length ? wanted : [...PIECES, ...EXTRAS];
 mkdirSync("art/out", { recursive: true });
 mkdirSync("src/assets/pieces", { recursive: true });
 
-const server = await createServer({ server: { port: 4190, strictPort: true }, logLevel: "error" });
+const server = await createServer({ server: { port: 4191, strictPort: true }, logLevel: "error" });
 await server.listen();
 const browser = await chromium.launch({ args: ["--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist"] });
 const page = await browser.newPage();
 page.on("console", (m) => m.type() === "error" && console.error("studio:", m.text()));
 page.on("pageerror", (e) => console.error("studio:", e.message));
-await page.goto("http://localhost:4190/art/studio.html");
+await page.goto("http://localhost:4191/art/studio.html");
 await page.waitForFunction(() => window.studio);
 
 const render = async (name, pixels, options) => {

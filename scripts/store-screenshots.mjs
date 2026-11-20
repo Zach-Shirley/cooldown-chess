@@ -5,7 +5,7 @@ import { mkdirSync } from "node:fs";
 import { chromium } from "playwright";
 import { openRoom, playLine, playOnlineLine, square, waitForTurn } from "./lib/board-dom.mjs";
 
-const APP = process.argv[2] ?? "http://localhost:4274";
+const APP = process.argv[2] ?? "http://localhost:4374";
 const outDir = "store/screenshots/raw";
 mkdirSync(outDir, { recursive: true });
 

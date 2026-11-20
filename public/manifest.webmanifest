@@ -1,12 +1,12 @@
 {
-  "name": "Chess",
-  "short_name": "Chess",
-  "description": "Play a bot, a friend on one screen, or an opponent online.",
+  "name": "Cooldown Chess",
+  "short_name": "Cooldown",
+  "description": "Real-time chess with no turns. Every piece has its own cooldown; capture the king to win.",
   "start_url": "/",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#0a0607",
-  "theme_color": "#0a0607",
+  "background_color": "#05080c",
+  "theme_color": "#05080c",
   "icons": [
     { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
     { "src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png" }

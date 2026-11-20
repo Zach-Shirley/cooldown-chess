@@ -1,20 +1,21 @@
-import type { ReactNode } from "react";
+import { useRef, type ReactNode } from "react";
 import {
   BOARD_SIZE,
-  getCheckedKingSquare,
   getPieceAt,
   isDarkSquare,
+  isReady,
+  parseSquare,
   pieceName,
   playerName,
   squareName,
   type GameState,
   type Move,
-  type MoveLogEntry,
   type Piece,
   type Player,
   type Square
 } from "../game";
 import { PieceToken, type PieceAnimation } from "./PieceToken";
+import { READY_FLASH_MS, type BoardNotice, type ClockView, type Selection } from "./realtime";
 
 const indexes = Array.from({ length: BOARD_SIZE }, (_, index) => index);
 
@@ -23,67 +24,121 @@ type BoardProps = {
   // Whose pieces sit at the bottom of the screen.
   perspective: Player;
   label: string;
-  selectedPieceId: string | null;
-  // Legal moves of the selected piece; their destinations are marked.
-  targets: Move[];
-  // Pieces the local player can move right now (they get a pointer and a hover lift).
-  movablePieceIds?: ReadonlySet<string> | ReadonlyMap<string, unknown>;
-  animation: PieceAnimation | null;
+  // The game time of this render and the clock it came from (cooldown rings read both).
+  now: number;
+  clock: ClockView;
+  // One selection per player at this device: the selected piece and where it can go.
+  selections: Selection[];
+  // The sides that can be played from this device (their pieces get a pointer cursor).
+  sides: readonly Player[];
+  animations: PieceAnimation[];
   onAnimationEnd: (animationId: number) => void;
-  onSquareClick: (square: Square) => void;
-  // Variant hooks: a status badge drawn over a piece, and extra class names for a square.
-  pieceBadge?: (piece: Piece, square: Square) => ReactNode;
-  squareClassName?: (square: Square, piece: Piece | null) => string;
+  // Pointer input, one call per finger: where it went down, and where it came up.
+  onSquareDown: (square: Square) => void;
+  onSquareUp: (square: Square, downSquare: Square) => void;
+  // Kings to warn about (a UI aid; there is no check in the rules).
+  dangerSquares?: Square[];
+  notices?: BoardNotice[];
+  // Draw Black's pieces upside down, for a player sitting on the far side of one device.
+  flipBlack?: boolean;
+  // Drawn over the board: the start countdown.
+  overlay?: ReactNode;
 };
 
-// The one board renderer, shared by local, bot and online games.
+// The one board renderer, shared by same-screen, bot and online games.
 export function Board({
   state,
   perspective,
   label,
-  selectedPieceId,
-  targets,
-  movablePieceIds,
-  animation,
+  now,
+  clock,
+  selections,
+  sides,
+  animations,
   onAnimationEnd,
-  onSquareClick,
-  pieceBadge,
-  squareClassName
+  onSquareDown,
+  onSquareUp,
+  dangerSquares = [],
+  notices = [],
+  flipBlack = false,
+  overlay
 }: BoardProps) {
   const rows = perspective === "black" ? [...indexes].reverse() : indexes;
   const cols = perspective === "black" ? [...indexes].reverse() : indexes;
-  const lastMove = state.moveLog[state.moveLog.length - 1];
-  const isLastMoveSquare = (row: number, col: number) =>
-    Boolean(lastMove) &&
-    ((lastMove.from.row === row && lastMove.from.col === col) || (lastMove.to.row === row && lastMove.to.col === col));
-  const checked = getCheckedKingSquare(state);
+  // Where each active pointer went down, so a release elsewhere is a drag.
+  const pressed = useRef(new Map<number, Square>());
+
+  // The latest move of each side stays tinted.
+  const lastMoves: Partial<Record<Player, GameState["moveLog"][number]>> = {};
+  for (let index = state.moveLog.length - 1; index >= 0 && !(lastMoves.white && lastMoves.black); index -= 1) {
+    const entry = state.moveLog[index];
+    lastMoves[entry.player] ??= entry;
+  }
+  const lastMoveBy = (row: number, col: number): Player | null => {
+    for (const player of ["white", "black"] as const) {
+      const entry = lastMoves[player];
+      if (entry && ((entry.from.row === row && entry.from.col === col) || (entry.to.row === row && entry.to.col === col))) return player;
+    }
+    return null;
+  };
 
   const animationFor = (piece: Piece): PieceAnimation | null => {
-    if (!animation) return null;
-    if (animation.pieceId === piece.id) return animation;
-    if (animation.companion?.pieceId === piece.id) return { ...animation, ...animation.companion, mode: "slide" };
+    for (const animation of animations) {
+      if (animation.pieceId === piece.id) return animation;
+      if (animation.companion?.pieceId === piece.id) return { ...animation, ...animation.companion, mode: "slide", companion: undefined };
+    }
     return null;
+  };
+
+  const squareUnder = (x: number, y: number): Square | null => {
+    const element = document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-square]");
+    return element?.dataset.square ? parseSquare(element.dataset.square) : null;
   };
 
   return (
     <div className="board-frame">
-      <div className="board" role="grid" aria-label={label}>
+      <div
+        className={`board${flipBlack ? " flip-black" : ""}`}
+        role="grid"
+        aria-label={label}
+        onPointerUp={(event) => {
+          const down = pressed.current.get(event.pointerId);
+          pressed.current.delete(event.pointerId);
+          const up = squareUnder(event.clientX, event.clientY);
+          if (down && up) onSquareUp(up, down);
+        }}
+        onPointerCancel={(event) => pressed.current.delete(event.pointerId)}
+      >
         {rows.flatMap((row, visualRow) =>
           cols.map((col, visualCol) => {
             const square = { row, col };
             const piece = getPieceAt(state, square);
-            const target = targets.find((move) => move.to.row === row && move.to.col === col);
-            const inCheck = Boolean(checked && checked.row === row && checked.col === col);
+            let target: Move | undefined;
+            let targetOwner: Selection | undefined;
+            for (const selection of selections) {
+              const move = selection.targets.find((candidate) => candidate.to.row === row && candidate.to.col === col);
+              if (move) {
+                target = move;
+                targetOwner = selection;
+              }
+            }
+            const selectedBy = piece ? selections.find((selection) => selection.pieceId === piece.id) : undefined;
+            const inDanger = dangerSquares.some((danger) => danger.row === row && danger.col === col);
+            const lastBy = lastMoveBy(row, col);
+            const cooling = piece ? !isReady(piece, now) : false;
+            const justReady = Boolean(piece && !cooling && piece.readyAt > 0 && now - piece.readyAt < READY_FLASH_MS);
+            const notice = piece ? notices.find((item) => item.pieceId === piece.id) : undefined;
+            const playable = Boolean(piece && sides.includes(piece.player));
             const classes = [
               "square",
               isDarkSquare(square) ? "dark-square" : "light-square",
               target ? "legal-square" : "",
               target?.captures.length ? "capture-square" : "",
-              piece && movablePieceIds?.has(piece.id) ? "movable-square" : "",
-              piece && selectedPieceId === piece.id ? "selected-square" : "",
-              isLastMoveSquare(row, col) ? "last-move-square" : "",
-              inCheck ? "check-square" : "",
-              squareClassName?.(square, piece) ?? ""
+              targetOwner?.pending ? "pending-target" : "",
+              playable ? "movable-square" : "",
+              selectedBy ? `selected-square by-${selectedBy.player}` : "",
+              lastBy ? `last-move-square last-${lastBy}` : "",
+              inDanger ? "danger-square" : ""
             ];
 
             return (
@@ -94,18 +149,36 @@ export function Board({
                 role="gridcell"
                 data-square={squareName(square)}
                 data-piece={piece ? `${piece.player}-${piece.kind}` : undefined}
-                aria-label={squareAriaLabel(square, piece, target, inCheck)}
-                onClick={() => onSquareClick(square)}
+                data-cooling={cooling ? "true" : undefined}
+                aria-label={squareAriaLabel(square, piece, target, cooling, inDanger)}
+                onPointerDown={(event) => {
+                  if (event.button > 0) return;
+                  // Touch pointers are captured by the element they start on; release that so
+                  // the pointerup reports where the finger really is.
+                  if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+                  pressed.current.set(event.pointerId, square);
+                  onSquareDown(square);
+                }}
+                onClick={(event) => {
+                  // Pointer input is handled above; this is the keyboard (Enter or Space).
+                  if (event.detail !== 0) return;
+                  onSquareDown(square);
+                  onSquareUp(square, square);
+                }}
               >
                 {visualCol === 0 ? <span className="rank-label" aria-hidden="true">{BOARD_SIZE - row}</span> : null}
                 {visualRow === BOARD_SIZE - 1 ? <span className="file-label" aria-hidden="true">{String.fromCharCode(97 + col)}</span> : null}
-                {target ? <span className="move-target" aria-hidden="true" /> : null}
+                {target && targetOwner ? <span className={`move-target ${targetOwner.player}`} aria-hidden="true" /> : null}
                 {piece ? (
                   <PieceToken
+                    // A new key restarts the ring's CSS animation from freshly read values.
+                    key={`${piece.id}:${piece.readyAt}:${clock.epoch}`}
                     piece={piece}
                     animation={animationFor(piece)}
                     onAnimationEnd={onAnimationEnd}
-                    badge={pieceBadge?.(piece, square)}
+                    cooldown={cooling ? { remainingMs: piece.readyAt - clock.now(), totalMs: state.rules.cooldownMs, running: clock.running } : null}
+                    justReady={justReady}
+                    notice={notice?.text}
                   />
                 ) : null}
               </button>
@@ -113,46 +186,15 @@ export function Board({
           })
         )}
       </div>
+      {overlay}
     </div>
   );
 }
 
-function squareAriaLabel(square: Square, piece: Piece | null, move: Move | undefined, inCheck: boolean) {
+function squareAriaLabel(square: Square, piece: Piece | null, move: Move | undefined, cooling: boolean, inDanger: boolean) {
   const contents = piece ? `${playerName(piece.player)} ${pieceName(piece.kind)}` : "empty";
-  const checkText = inCheck ? ", in check" : "";
-  const moveText = move ? (move.captures.length > 0 ? ", capture destination" : ", legal destination") : "";
-  return `${squareName(square)}, ${contents}${checkText}${moveText}`;
-}
-
-// Builds the animation for a move seen from `perspective` (a flipped board mirrors both axes).
-// Knights hop; everything else slides. Castling slides the rook along with the king.
-export function moveAnimation(
-  move: Pick<MoveLogEntry, "from" | "to" | "pieceKind" | "rook">,
-  options: { id: number; pieceId: string; perspective: Player; direction: PieceAnimation["direction"] }
-): PieceAnimation {
-  const flip = options.perspective === "black" ? -1 : 1;
-  const sign = options.direction === "from" ? -1 : 1;
-  const offset = (from: Square, to: Square) => ({
-    dx: (to.col - from.col) * flip * sign,
-    dy: (to.row - from.row) * flip * sign
-  });
-  return {
-    id: options.id,
-    pieceId: options.pieceId,
-    mode: move.pieceKind === "knight" ? "hop" : "slide",
-    direction: options.direction,
-    ...offset(move.from, move.to),
-    companion: move.rook ? { pieceId: move.rook.pieceId, ...offset(move.rook.from, move.rook.to) } : undefined
-  };
-}
-
-export function groupMovesByPiece(moves: Move[]) {
-  const grouped = new Map<string, Move[]>();
-  for (const move of moves) grouped.set(move.pieceId, [...(grouped.get(move.pieceId) ?? []), move]);
-  return grouped;
-}
-
-// The moves of the selected piece that land on `square`: one normally, four for a promotion.
-export function movesTo(moves: Move[], square: Square) {
-  return moves.filter((move) => move.to.row === square.row && move.to.col === square.col);
+  const coolingText = cooling ? ", cooling down" : "";
+  const dangerText = inDanger ? ", king in danger" : "";
+  const moveText = move ? (move.captures.length > 0 ? ", capture destination" : ", move destination") : "";
+  return `${squareName(square)}, ${contents}${coolingText}${dangerText}${moveText}`;
 }

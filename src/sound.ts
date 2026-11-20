@@ -1,9 +1,9 @@
 // Small synthesized sound effects (no audio files). Muted state is remembered per device.
 import { useSyncExternalStore } from "react";
 
-export type SoundName = "move" | "capture" | "check" | "promote" | "win" | "lose" | "draw";
+export type SoundName = "move" | "capture" | "danger" | "deny" | "count" | "go" | "promote" | "win" | "lose" | "draw";
 
-const STORAGE_KEY = "chess-base:muted";
+const STORAGE_KEY = "cooldown-chess:muted";
 let muted = readMuted();
 let context: AudioContext | null = null;
 const listeners = new Set<() => void>();
@@ -103,11 +103,12 @@ export function playSound(name: SoundName) {
     tock(ctx, now, 150, 0.26);
     tock(ctx, now + 0.085, 230, 0.2);
   }
-  if (name === "check") {
-    // The move's tock, then two quick rising notes: unmistakably "watch your king".
-    tock(ctx, now, 190, 0.22);
-    [740, 988].forEach((f, i) => note(ctx, now + 0.07 + i * 0.075, f, 0.22, 0.06));
-  }
+  // King in danger: two quick rising notes, unmistakably "watch your king".
+  if (name === "danger") [740, 988].forEach((f, i) => note(ctx, now + i * 0.075, f, 0.22, 0.07));
+  // A tap on a piece that is still cooling: a dull, quiet knock.
+  if (name === "deny") tock(ctx, now, 105, 0.12);
+  if (name === "count") note(ctx, now, 440, 0.16, 0.05);
+  if (name === "go") note(ctx, now, 880, 0.4, 0.07);
   if (name === "promote") [523, 784].forEach((f, i) => note(ctx, now + i * 0.09, f, 0.35, 0.07));
   if (name === "draw") [440, 440].forEach((f, i) => note(ctx, now + i * 0.2, f, 0.45, 0.06));
   if (name === "win") [392, 523, 659, 784].forEach((f, i) => note(ctx, now + i * 0.11, f, 0.5, 0.08));
@@ -115,8 +116,7 @@ export function playSound(name: SoundName) {
 }
 
 // The sound for one move-log entry.
-export function soundForMove(entry: { captured: unknown[]; check: boolean; promotion?: string }): SoundName {
-  if (entry.check) return "check";
+export function soundForMove(entry: { captured: unknown[]; promotion?: string }): SoundName {
   if (entry.promotion) return "promote";
   return entry.captured.length > 0 ? "capture" : "move";
 }

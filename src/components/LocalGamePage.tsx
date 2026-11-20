@@ -1,184 +1,186 @@
-import { useEffect, useMemo, useState } from "react";
-import { BookOpen, Home, RotateCcw, Undo2 } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { BookOpen, FlipVertical2, Home, Pause, Play, RotateCcw } from "lucide-react";
 import {
   type GameRules,
-  type GameState,
   type Move,
   type Player,
-  type Square,
-  applyMove,
   createInitialState,
-  getLegalMoves,
-  getPieceAt,
   opponentOf,
-  playerName
+  playerName,
+  tryMove
 } from "../game";
-import { BOT_LEVELS, type BotLevel } from "../bot";
-import { requestBotAction } from "../botClient";
+import { BOT_LEVELS, BOT_TICK_MS, BotAgent, type BotLevel } from "../bot";
 import { getPlayerIdentity } from "../playerIdentity";
-import { playSound, soundForMove } from "../sound";
-import { Board, groupMovesByPiece, moveAnimation, movesTo } from "../ui/Board";
-import { MoveList, PlayerBar, RulesDialog, SoundToggle, TurnStatus } from "../ui/GameChrome";
+import { clockNow, pauseClock, resumeClock, startClock, type GameClock } from "../variant/clock";
+import { Board } from "../ui/Board";
+import { MoveFeed, PlayerBar, RulesDialog, SoundToggle, StartCountdown, StatusBar, cooldownLabel } from "../ui/GameChrome";
 import { GameOverDialog } from "../ui/GameOverDialog";
 import { Modal } from "../ui/Modal";
-import type { PieceAnimation } from "../ui/PieceToken";
-import { PromotionPicker } from "../ui/PromotionPicker";
+import { useClockTick, useGameSounds, useKingDanger, useMoveEffects, useSelections, type ClockView } from "../ui/realtime";
 
 type GameDialog = "new-game" | "rules" | null;
-
-// Pause before the bot moves so its reply reads as a move, not a flicker.
-const BOT_MIN_THINK_MS = 650;
 
 export type BotOpponent = { player: Player; level: BotLevel };
 
 type LocalGamePageProps = {
   initialRules: GameRules;
   onExit: () => void;
-  // Without a bot this is pass-and-play.
+  // Without a bot this is a same-screen game: two people at one device.
   bot?: BotOpponent;
-  // Replaces the panel's "Pass & play" / "Vs bot" label, e.g. while a quick match is searching.
+  // Replaces the panel's "Same screen" / "Vs bot" label, e.g. while a quick match is searching.
   kicker?: string;
+  // Same-screen only: draw Black's pieces upside down for the player sitting opposite.
+  initialFlipBlack?: boolean;
 };
 
-export function LocalGamePage({ initialRules, onExit, bot, kicker }: LocalGamePageProps) {
-  const [history, setHistory] = useState(() => [createInitialState(initialRules)]);
-  const [selectedPieceId, setSelectedPieceId] = useState<string | null>(null);
-  const [pieceAnimation, setPieceAnimation] = useState<PieceAnimation | null>(null);
+const BOTH_SIDES: readonly Player[] = ["white", "black"];
+const ONLY: Record<Player, readonly Player[]> = { white: ["white"], black: ["black"] };
+
+// The game clock of a local game. It runs on performance.now() and stops whenever `paused` is
+// true, so opening a dialog or hiding the tab freezes every cooldown.
+function useLocalClock(paused: boolean) {
+  const clockRef = useRef<GameClock | null>(null);
+  if (!clockRef.current) clockRef.current = startClock(performance.now());
+  const [epoch, setEpoch] = useState(0);
+
+  useEffect(() => {
+    const wall = performance.now();
+    clockRef.current = paused ? pauseClock(clockRef.current!, wall) : resumeClock(clockRef.current!, wall);
+    setEpoch((current) => current + 1);
+  }, [paused]);
+
+  const restart = useCallback(() => {
+    clockRef.current = startClock(performance.now());
+    setEpoch((current) => current + 1);
+  }, []);
+
+  const view: ClockView = useMemo(
+    () => ({ now: () => clockNow(clockRef.current!, performance.now()), running: !paused, epoch }),
+    [paused, epoch]
+  );
+  return { clock: view, restart };
+}
+
+function useTabHidden() {
+  const [hidden, setHidden] = useState(() => document.hidden);
+  useEffect(() => {
+    const update = () => setHidden(document.hidden);
+    document.addEventListener("visibilitychange", update);
+    return () => document.removeEventListener("visibilitychange", update);
+  }, []);
+  return hidden;
+}
+
+export function LocalGamePage({ initialRules, onExit, bot, kicker, initialFlipBlack = false }: LocalGamePageProps) {
+  const [state, setState] = useState(() => createInitialState(initialRules));
+  const [gameNumber, setGameNumber] = useState(0);
   const [dialog, setDialog] = useState<GameDialog>(null);
-  // The promotion moves waiting for the player to pick a piece.
-  const [promotion, setPromotion] = useState<Move[] | null>(null);
-  const state = history[history.length - 1];
-  const legalMoves = useMemo(() => getLegalMoves(state), [state]);
-  const movesByPiece = useMemo(() => groupMovesByPiece(legalMoves), [legalMoves]);
-  const selectedMoves = selectedPieceId ? movesByPiece.get(selectedPieceId) ?? [] : [];
+  const [userPaused, setUserPaused] = useState(false);
+  const [flipBlack, setFlipBlack] = useState(initialFlipBlack);
+  const tabHidden = useTabHidden();
+
   const botPlayer = bot?.player ?? null;
   const botLevel = bot?.level ?? null;
   const humanPlayer = botPlayer ? opponentOf(botPlayer) : null;
-  // The human's pieces sit at the bottom; pass-and-play keeps White at the bottom.
+  // The human's pieces sit at the bottom; a same-screen game keeps White at the bottom.
   const perspective: Player = humanPlayer ?? "white";
   const topPlayer = opponentOf(perspective);
+  const sides = humanPlayer ? ONLY[humanPlayer] : BOTH_SIDES;
   const playing = state.status.phase === "playing";
-  const isBotTurn = Boolean(botPlayer && playing && state.currentPlayer === botPlayer);
-  const phase = state.status.phase;
-  const winner = state.status.phase === "won" ? state.status.winner : null;
 
+  const paused = !playing || userPaused || dialog !== null || tabHidden;
+  const { clock, restart } = useLocalClock(paused);
+  const now = useClockTick(state, clock);
+  const { animations, onAnimationEnd } = useMoveEffects(state, perspective);
+  const dangerSquares = useKingDanger(state, now, sides);
+  useGameSounds(state, now, humanPlayer);
+
+  const stateRef = useRef(state);
+  stateRef.current = state;
+
+  // Every move, from either player or the bot, goes through the engine with the clock's time.
+  const playMove = useCallback(
+    (player: Player, moveId: string) => {
+      const result = tryMove(stateRef.current, player, moveId, clock.now());
+      if (!result.ok) return;
+      stateRef.current = result.state;
+      setState(result.state);
+    },
+    [clock]
+  );
+
+  const { selections, notices, onSquareDown, onSquareUp, clear } = useSelections({
+    state,
+    now,
+    clock,
+    sides,
+    enabled: playing && !paused,
+    onMove: useCallback((player: Player, move: Move) => playMove(player, move.id), [playMove])
+  });
+
+  // The bot: one small decision every tick, on the game clock (so it pauses with the game).
+  const agent = useMemo(
+    () => (botPlayer && botLevel ? new BotAgent(botPlayer, botLevel) : null),
+    // A new game (gameNumber) gets a new agent.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [botPlayer, botLevel, gameNumber]
+  );
   useEffect(() => {
-    if (selectedPieceId && !movesByPiece.has(selectedPieceId)) setSelectedPieceId(null);
-  }, [movesByPiece, selectedPieceId]);
-
-  useEffect(() => {
-    if (!botLevel || !isBotTurn) return;
-    let cancelled = false;
-    const started = performance.now();
-    requestBotAction(state, botLevel).then((action) => {
-      const wait = Math.max(0, BOT_MIN_THINK_MS - (performance.now() - started));
-      window.setTimeout(() => {
-        if (cancelled || !action) return;
-        const move = legalMoves.find((candidate) => candidate.id === action.moveId);
-        if (move) playMove(move);
-      }, wait);
-    });
-    return () => {
-      cancelled = true;
-    };
-    // playMove only reads `state`, which is a dependency.
-  }, [botLevel, isBotTurn, state, legalMoves]);
-
-  useEffect(() => {
-    if (phase === "draw") playSound("draw");
-    if (phase === "won") playSound(humanPlayer && winner !== humanPlayer ? "lose" : "win");
-  }, [phase, winner, humanPlayer]);
-
-  function playMove(move: Move) {
-    const nextState = applyMove(state, move.id);
-    setPieceAnimation(
-      moveAnimation(move, { id: state.moveLog.length + 1, pieceId: move.pieceId, perspective, direction: "from" })
-    );
-    playSound(soundForMove(nextState.moveLog[nextState.moveLog.length - 1]));
-    setHistory((currentHistory) => [...currentHistory, nextState]);
-    setSelectedPieceId(null);
-    setPromotion(null);
-  }
-
-  function handleSquareClick(square: Square) {
-    if (!playing || isBotTurn) return;
-
-    const destinationMoves = movesTo(selectedMoves, square);
-    if (destinationMoves.length > 1) {
-      setPromotion(destinationMoves);
-      return;
-    }
-    if (destinationMoves.length === 1) {
-      playMove(destinationMoves[0]);
-      return;
-    }
-
-    const piece = getPieceAt(state, square);
-    if (piece?.player === state.currentPlayer && movesByPiece.has(piece.id)) {
-      setSelectedPieceId(piece.id === selectedPieceId ? null : piece.id);
-      return;
-    }
-
-    setSelectedPieceId(null);
-  }
-
-  function undoMove() {
-    setHistory((currentHistory) => {
-      if (currentHistory.length <= 1) return currentHistory;
-      let target = currentHistory.length - 2;
-      // Against a bot, step back past its reply to the human's last turn.
-      if (humanPlayer) {
-        while (target > 0 && currentHistory[target].currentPlayer !== humanPlayer) target -= 1;
-      }
-      return currentHistory.slice(0, target + 1);
-    });
-    setSelectedPieceId(null);
-    setPieceAnimation(null);
-    setPromotion(null);
-  }
+    if (!agent || !botPlayer || paused) return;
+    const timer = window.setInterval(() => {
+      const moveId = agent.tick(stateRef.current, clock.now());
+      if (moveId) playMove(botPlayer, moveId);
+    }, BOT_TICK_MS);
+    return () => window.clearInterval(timer);
+  }, [agent, botPlayer, paused, clock, playMove]);
 
   function resetBoard() {
-    setHistory([createInitialState(state.rules)]);
-    setSelectedPieceId(null);
-    setPieceAnimation(null);
-    setPromotion(null);
+    const fresh = createInitialState(state.rules);
+    stateRef.current = fresh;
+    setState(fresh);
+    setGameNumber((current) => current + 1);
+    setUserPaused(false);
     setDialog(null);
+    clear();
+    restart();
   }
 
   const botName = botLevel ? `${BOT_LEVELS[botLevel].label} bot` : null;
   const ownName = bot ? getPlayerIdentity().name : "Player 1";
-  const turnTitle = playing ? `${playerName(state.currentPlayer)} to move` : "Game over";
-  const turnMessage = isBotTurn ? "The bot is thinking..." : getStateMessage(state, humanPlayer);
-  // Against a bot, undo is only useful once the human has made a move.
-  const canUndo = humanPlayer
-    ? history.some((entry, index) => index < history.length - 1 && entry.currentPlayer === humanPlayer)
-    : history.length > 1;
+  const started = state.moveLog.length > 0;
+  const showPauseCard = playing && userPaused && dialog === null;
 
   return (
     <main className="game-page">
-      <section className="game-workspace" aria-label="Local chess game">
+      <section className="game-workspace" aria-label={bot ? "Game against a bot" : "Same-screen game"}>
         <div className="board-column">
           <PlayerBar
             player={topPlayer}
             name={botName ?? "Player 2"}
             tag={bot ? `Bot · ${playerName(topPlayer)}` : playerName(topPlayer)}
             state={state}
-            active={playing && state.currentPlayer === topPlayer}
+            now={now}
+            live={playing && !paused && now >= 0}
             isBot={Boolean(bot)}
+            flipped={!bot && flipBlack}
           />
 
           <Board
             state={state}
             perspective={perspective}
             label="Chess board"
-            selectedPieceId={selectedPieceId}
-            targets={selectedMoves}
-            movablePieceIds={isBotTurn ? undefined : movesByPiece}
-            animation={pieceAnimation}
-            onAnimationEnd={(animationId) =>
-              setPieceAnimation((current) => (current?.id === animationId ? null : current))
-            }
-            onSquareClick={handleSquareClick}
+            now={now}
+            clock={clock}
+            selections={selections}
+            sides={sides}
+            animations={animations}
+            onAnimationEnd={onAnimationEnd}
+            onSquareDown={onSquareDown}
+            onSquareUp={onSquareUp}
+            dangerSquares={dangerSquares}
+            notices={notices}
+            flipBlack={!bot && flipBlack}
+            overlay={<StartCountdown state={state} now={now} paused={paused} />}
           />
 
           <PlayerBar
@@ -186,39 +188,75 @@ export function LocalGamePage({ initialRules, onExit, bot, kicker }: LocalGamePa
             name={ownName}
             tag={bot ? `You · ${playerName(perspective)}` : playerName(perspective)}
             state={state}
-            active={playing && state.currentPlayer === perspective}
+            now={now}
+            live={playing && !paused && now >= 0}
           />
+
+          {showPauseCard ? (
+            <div className="game-event-layer" role="status">
+              <section className="game-event-card">
+                <span className="game-event-icon" aria-hidden="true"><Pause size={28} /></span>
+                <p className="section-kicker">Paused</p>
+                <h2>Every cooldown is frozen</h2>
+                <p>The board is hidden while the game is paused.</p>
+                <div className="game-event-actions">
+                  <button className="button primary" type="button" onClick={() => setUserPaused(false)}>
+                    <Play aria-hidden="true" size={17} />
+                    Resume
+                  </button>
+                </div>
+              </section>
+            </div>
+          ) : null}
         </div>
 
-        <aside className="game-panel" aria-label="Game controls and move history">
+        <aside className="game-panel" aria-label="Game controls and move feed">
           <header className="game-panel-header">
             <button className="icon-button" type="button" onClick={onExit} aria-label="Return home" title="Home">
               <Home aria-hidden="true" size={19} />
             </button>
             <div>
-              <p className="section-kicker">{kicker ?? (bot ? "Vs bot" : "Pass & play")}</p>
-              <strong>{botName ?? "Local game"}</strong>
+              <p className="section-kicker">{kicker ?? `${bot ? "Vs bot" : "Same screen"} · ${cooldownLabel(state.rules)}`}</p>
+              <strong>{botName ?? "Two players, one board"}</strong>
             </div>
             <SoundToggle />
           </header>
 
-          <TurnStatus state={state} title={turnTitle} message={turnMessage} />
+          <StatusBar
+            state={state}
+            now={now}
+            paused={playing && paused}
+            danger={Boolean(humanPlayer) && dangerSquares.length > 0}
+            message={!bot && playing && !paused && now >= 0 ? "No turns. Both of you can move at once." : undefined}
+          />
 
-          <MoveList state={state} />
+          <MoveFeed state={state} />
 
-          <footer className="game-actions">
-            <button type="button" onClick={undoMove} disabled={!canUndo} title="Undo last move">
-              <Undo2 aria-hidden="true" size={19} />
-              <span>Undo</span>
-            </button>
+          <footer className={`game-actions ${bot ? "" : "four-actions"}`}>
             <button
               type="button"
-              onClick={() => (state.moveLog.length === 0 || !playing ? resetBoard() : setDialog("new-game"))}
+              onClick={() => (!started || !playing ? resetBoard() : setDialog("new-game"))}
               title="Start a new game"
             >
               <RotateCcw aria-hidden="true" size={19} />
               <span>New game</span>
             </button>
+            <button type="button" onClick={() => setUserPaused((current) => !current)} disabled={!playing} title="Pause the game">
+              {userPaused ? <Play aria-hidden="true" size={19} /> : <Pause aria-hidden="true" size={19} />}
+              <span>{userPaused ? "Resume" : "Pause"}</span>
+            </button>
+            {bot ? null : (
+              <button
+                type="button"
+                className={flipBlack ? "toggled" : ""}
+                aria-pressed={flipBlack}
+                onClick={() => setFlipBlack((current) => !current)}
+                title="Turn Black's pieces to face a player sitting opposite"
+              >
+                <FlipVertical2 aria-hidden="true" size={19} />
+                <span>Flip Black</span>
+              </button>
+            )}
             <button type="button" onClick={() => setDialog("rules")} title="View rules">
               <BookOpen aria-hidden="true" size={19} />
               <span>Rules</span>
@@ -227,12 +265,10 @@ export function LocalGamePage({ initialRules, onExit, bot, kicker }: LocalGamePa
         </aside>
       </section>
 
-      {promotion ? <PromotionPicker moves={promotion} onPick={playMove} onCancel={() => setPromotion(null)} /> : null}
-
       {dialog === "new-game" ? (
         <Modal
           title="Start a new game?"
-          description="The current game and its move history will be cleared."
+          description="The current game and its move feed will be cleared."
           onClose={() => setDialog(null)}
         >
           <div className="modal-actions">
@@ -247,7 +283,7 @@ export function LocalGamePage({ initialRules, onExit, bot, kicker }: LocalGamePa
         </Modal>
       ) : null}
 
-      {dialog === null && !promotion ? (
+      {dialog === null ? (
         <GameOverDialog
           state={state}
           you={humanPlayer}
@@ -261,13 +297,4 @@ export function LocalGamePage({ initialRules, onExit, bot, kicker }: LocalGamePa
       {dialog === "rules" ? <RulesDialog onClose={() => setDialog(null)} /> : null}
     </main>
   );
-}
-
-function getStateMessage(state: GameState, humanPlayer: Player | null) {
-  const { status } = state;
-  if (status.phase !== "playing") return status.message;
-  if (status.check) {
-    return humanPlayer ? "You are in check. Get your king to safety." : `${playerName(state.currentPlayer)} is in check.`;
-  }
-  return "Select a piece to make a move.";
 }

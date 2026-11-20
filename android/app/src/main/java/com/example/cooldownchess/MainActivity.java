@@ -1,4 +1,4 @@
-package com.example.chessbase;
+package com.example.cooldownchess;
 
 import com.getcapacitor.BridgeActivity;
 

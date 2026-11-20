@@ -23,6 +23,7 @@ export function App() {
   const [route, setRoute] = useState<AppRoute>(getRoute);
   const [localRules, setLocalRules] = useState<GameRules>(DEFAULT_GAME_RULES);
   const [localSession, setLocalSession] = useState(0);
+  const [flipBlack, setFlipBlack] = useState(false);
   const [botLevel, setBotLevel] = useState<BotLevel>("medium");
   const [botPlayer, setBotPlayer] = useState<Player>("black");
 
@@ -40,8 +41,9 @@ export function App() {
     }
   }
 
-  function startLocalGame(rules: GameRules) {
+  function startLocalGame(rules: GameRules, flip: boolean) {
     setLocalRules(rules);
+    setFlipBlack(flip);
     setLocalSession((current) => current + 1);
     navigate("/local");
   }
@@ -59,6 +61,7 @@ export function App() {
       <LocalGamePage
         key={localSession}
         initialRules={localRules}
+        initialFlipBlack={flipBlack}
         onExit={() => navigate("/")}
       />
     );

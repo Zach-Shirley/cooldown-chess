@@ -8,7 +8,7 @@ Every piece, the board and the home-screen scene are rendered from 3D models, no
   - The knight is its outline extruded and rounded, with a carved mane, on the same pedestal.
   - Two sides: `white` is warm ivory lacquer, `black` is obsidian lacquer.
   - Every sprite shares one camera frame sized for the king and one floor line, so the pieces keep their relative heights on the board (king tallest, pawn shortest).
-- `render.mjs`: runs the studio in headless Chromium (Playwright, port 4190) and writes the app's assets:
+- `render.mjs`: runs the studio in headless Chromium (Playwright, port 4191) and writes the app's assets:
   - `src/assets/pieces/<kind>-<side>.webp`: twelve 288px sprites with a baked contact shadow and a thin dark halo (stronger on ivory, so it stays readable on light squares)
   - `src/assets/hero.webp`, `hero-tall.webp`: home-screen backdrops, a middlegame on a 3D board
   - `art/piece-icon.png`: source for the app icon

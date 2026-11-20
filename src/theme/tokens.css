@@ -1,43 +1,62 @@
 /* Design tokens. Everything visual in the app reads from here; a new game restyles by editing
    this file (and swapping the rendered art in src/assets). */
 :root {
-  /* Surfaces: near-black with a warm red cast */
-  --ink-0: #0a0607;
-  --ink-1: #110b0d;
-  --ink-2: #191113;
-  --ink-3: #231719;
-  --ink-4: #2f2023;
-  --glass: rgba(255, 240, 240, 0.045);
-  --glass-strong: rgba(255, 240, 240, 0.085);
-  --line: rgba(255, 228, 228, 0.1);
-  --line-strong: rgba(255, 228, 228, 0.2);
+  /* Surfaces: near-black with a cold blue cast */
+  --ink-0: #05080c;
+  --ink-1: #0a0f15;
+  --ink-2: #101821;
+  --ink-3: #17222e;
+  --ink-4: #213141;
+  /* The pale tint that glass, hairlines and hover states are mixed from. */
+  --tint-rgb: 220, 236, 255;
+  --glass: rgba(var(--tint-rgb), 0.045);
+  --glass-strong: rgba(var(--tint-rgb), 0.085);
+  --line: rgba(var(--tint-rgb), 0.1);
+  --line-strong: rgba(var(--tint-rgb), 0.2);
+  --panel-top-rgb: 23, 34, 46;
+  --panel-bottom-rgb: 12, 18, 25;
+  --scrim-rgb: 3, 6, 10;
 
   /* Text */
-  --text: #f7f0ef;
-  --text-soft: #cdbfbf;
-  --text-mute: #948487;
+  --text: #eef5f9;
+  --text-soft: #b8c8d3;
+  --text-mute: #7d909d;
 
-  /* Brand and signals */
-  --crimson: #d92b3a;
-  --crimson-bright: #f24f5b;
-  --crimson-deep: #8a1221;
-  --crimson-glow: rgba(217, 43, 58, 0.38);
-  /* Amber is reserved for "your attention here": the side to move, selections, legal moves. */
+  /* Brand and signals: electric ice blue */
+  --accent: #18b9f5;
+  --accent-bright: #6ad9ff;
+  --accent-strong: #0e9bd4;
+  --accent-deep: #0a6f9c;
+  --accent-rgb: 24, 185, 245;
+  --accent-glow: rgba(var(--accent-rgb), 0.38);
+  /* Text and icons that sit on the accent colour. */
+  --on-accent: #021019;
+  --on-accent-rgb: 2, 16, 25;
+  /* Amber is reserved for "your attention here": selections and the newest move. */
   --amber: #f6b740;
   --amber-soft: rgba(246, 183, 64, 0.2);
   --ok: #54d394;
   --warn: #ff8f6b;
 
+  /* Cooldowns: each side's rings, move markers and feed dots use its own colour. */
+  --cool-white: #5fe0ff;
+  --cool-white-rgb: 95, 224, 255;
+  --cool-black: #ff7fb2;
+  --cool-black-rgb: 255, 127, 178;
+  /* Opacity of a piece that is cooling down. */
+  --cooling-opacity: 0.5;
+  --ready-flash-ms: 480ms;
+
   /* Board (keep in step with art/board.mjs) */
   --board-light: #d4c4a4;
   --board-dark: #476078;
-  --board-frame-top: #24121a;
-  --board-frame-bottom: #0d0709;
+  --board-frame-top: #131e29;
+  --board-frame-bottom: #070b10;
   --side-white: #efe3cb;
   --side-black: #25262c;
-  /* Check: the king's square glows in this colour. */
-  --check: #ff3d4d;
-  --check-glow: rgba(255, 61, 77, 0.6);
+  /* King in danger: the king's square pulses in this colour. */
+  --danger: #ff4257;
+  --danger-glow: rgba(255, 66, 87, 0.6);
 
   /* Shape */
   --r-xs: 8px;
@@ -56,8 +75,9 @@
   --shadow-pop: 0 30px 80px rgba(0, 0, 0, 0.65);
   --ease-out: cubic-bezier(0.22, 0.84, 0.34, 1);
   --ease-spring: cubic-bezier(0.3, 1.4, 0.5, 1);
-  --slide-ms: 300ms;
-  --hop-ms: 430ms;
+  /* Moves are quicker than in a turn-based game: the board never waits for an animation. */
+  --slide-ms: 190ms;
+  --hop-ms: 260ms;
 
   /* Layout */
   --panel-width: 372px;

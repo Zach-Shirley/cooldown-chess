@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { getMaterial, playerName, type DrawReason, type GameState, type Player } from "../game";
+import { getMaterial, playerName, type GameState, type Player } from "../game";
+import { formatClock } from "../variant/clock";
 import { Modal } from "./Modal";
 import { pieceSprite } from "./PieceToken";
 
@@ -9,21 +10,28 @@ export type GameOverAction = {
   disabled?: boolean;
 };
 
-const DRAW_TITLES: Record<DrawReason, string> = {
-  stalemate: "Stalemate",
-  "threefold-repetition": "Draw by repetition",
-  "fifty-move": "Draw by the fifty-move rule",
-  "insufficient-material": "Draw"
-};
-
 // The headline for a finished game. `you` is the local player's side, or null when both sides
 // share the screen.
 export function resultTitle(state: GameState, you: Player | null): string {
   const { status } = state;
-  if (status.phase === "draw") return DRAW_TITLES[status.reason];
+  if (status.phase === "draw") return "Draw";
   if (status.phase !== "won") return "";
+  if (status.reason === "king-captured") {
+    if (you === null) return "King captured!";
+    return status.winner === you ? "King captured!" : "Your king was captured";
+  }
   if (you === null) return `${playerName(status.winner)} wins!`;
   return status.winner === you ? "You win!" : "You lose";
+}
+
+// The line under the headline.
+export function resultDetail(state: GameState, you: Player | null): string {
+  const { status } = state;
+  if (status.phase !== "won" || status.reason !== "king-captured") return status.message;
+  const last = state.moveLog[state.moveLog.length - 1];
+  const when = last ? ` at ${formatClock(last.at)}` : "";
+  if (you === null) return `${playerName(status.winner)} took the king${when} and wins.`;
+  return status.winner === you ? `You took the enemy king${when}. You win.` : `${playerName(status.winner)} took it${when}. You lose.`;
 }
 
 // Shows once each time a game ends. "View board" closes it so the final position can be studied.
@@ -34,7 +42,7 @@ export function GameOverDialog({
   note
 }: {
   state: GameState;
-  // The local player's side, or null in pass-and-play where both sides share the screen.
+  // The local player's side, or null in a same-screen game.
   you: Player | null;
   // The first action is the primary button.
   actions: GameOverAction[];
@@ -56,7 +64,7 @@ export function GameOverDialog({
   const { score } = getMaterial(state);
 
   return (
-    <Modal title={resultTitle(state, you)} description={state.status.message} onClose={() => setDismissed(true)} tone={tone}>
+    <Modal title={resultTitle(state, you)} description={resultDetail(state, you)} onClose={() => setDismissed(true)} tone={tone}>
       <div className="result-score" aria-label={`Final material: White ${score.white}, Black ${score.black}`}>
         {(["white", "black"] as const).map((side) => (
           <div className={`result-side ${side} ${winner === side ? "winner" : ""} ${winner === null ? "drawn" : ""}`} key={side}>

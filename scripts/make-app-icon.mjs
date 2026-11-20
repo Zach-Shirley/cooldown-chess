@@ -6,7 +6,7 @@ import sharp from "sharp";
 
 const dark = "#476078";
 const light = "#d4c4a4";
-const night = "#0a0607";
+const night = "#05080c";
 
 // A 2x2 board corner. Apple masks the corners itself, so no rounding here.
 const board = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024">
