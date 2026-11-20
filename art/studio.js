@@ -478,7 +478,7 @@ function renderHero(pixels, { aspect = 16 / 9, eye = [9, 9, 20.5], target = [-1.
   }
   const frame = new THREE.Mesh(
     new THREE.BoxGeometry(tile * 8 + 1.6, 0.5, tile * 8 + 1.6),
-    new THREE.MeshPhysicalMaterial({ color: "#16090c", roughness: 0.3, clearcoat: 1 })
+    new THREE.MeshPhysicalMaterial({ color: "#0a121a", roughness: 0.3, clearcoat: 1 })
   );
   frame.position.y = -0.3;
   frame.receiveShadow = true;
@@ -506,7 +506,7 @@ function renderHero(pixels, { aspect = 16 / 9, eye = [9, 9, 20.5], target = [-1.
   key.shadow.bias = -0.0004;
   key.shadow.radius = 6;
   scene.add(key, key.target);
-  const rim = new THREE.SpotLight("#ff3b4f", 500, 0, 0.7, 0.9, 2);
+  const rim = new THREE.SpotLight("#22c3ff", 520, 0, 0.7, 0.9, 2);
   rim.position.set(14, 7, -12);
   rim.target.position.set(0, 0, 0);
   scene.add(rim, rim.target);
