@@ -1122,7 +1122,8 @@
 }
 
 .move-entry .move-san {
-  padding: 3px 6px;
+  padding: 3px 7px;
+  border-radius: var(--r-pill);
 }
 
 .move-entry.latest {

@@ -9,11 +9,11 @@ const OPTIONS: { value: ColorChoice; label: string }[] = [
   { value: "random", label: "Random" }
 ];
 
-// White always moves first, whichever side the player picks.
+// Nobody moves first in this game; the side only decides which pieces are yours.
 export function ColorPicker({ value, onChange }: { value: ColorChoice; onChange: (choice: ColorChoice) => void }) {
   return (
     <div className="color-picker">
-      <span className="field-caption">Your side · White moves first</span>
+      <span className="field-caption">Your side</span>
       <div className="segmented" role="radiogroup" aria-label="Your side">
         {OPTIONS.map((option) => (
           <button

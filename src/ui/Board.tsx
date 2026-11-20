@@ -14,6 +14,7 @@ import {
   type Player,
   type Square
 } from "../game";
+import { START_COUNTDOWN_MS } from "../variant/interpretation";
 import { PieceToken, type PieceAnimation } from "./PieceToken";
 import { READY_FLASH_MS, type BoardNotice, type ClockView, type Selection } from "./realtime";
 
@@ -126,7 +127,7 @@ export function Board({
             const inDanger = dangerSquares.some((danger) => danger.row === row && danger.col === col);
             const lastBy = lastMoveBy(row, col);
             const cooling = piece ? !isReady(piece, now) : false;
-            const justReady = Boolean(piece && !cooling && piece.readyAt > 0 && now - piece.readyAt < READY_FLASH_MS);
+            const justReady = Boolean(piece && !cooling && now - piece.readyAt < READY_FLASH_MS);
             const notice = piece ? notices.find((item) => item.pieceId === piece.id) : undefined;
             const playable = Boolean(piece && sides.includes(piece.player));
             const classes = [
@@ -176,7 +177,16 @@ export function Board({
                     piece={piece}
                     animation={animationFor(piece)}
                     onAnimationEnd={onAnimationEnd}
-                    cooldown={cooling ? { remainingMs: piece.readyAt - clock.now(), totalMs: state.rules.cooldownMs, running: clock.running } : null}
+                    cooldown={
+                      cooling
+                        ? {
+                            remainingMs: piece.readyAt - clock.now(),
+                            // Before the start, every piece's ring is the countdown itself.
+                            totalMs: piece.readyAt === 0 ? START_COUNTDOWN_MS : state.rules.cooldownMs,
+                            running: clock.running
+                          }
+                        : null
+                    }
                     justReady={justReady}
                     notice={notice?.text}
                   />

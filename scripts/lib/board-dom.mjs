@@ -1,8 +1,9 @@
-// Helpers that drive the board through the DOM, the way a player would: they only click
+// Helpers that drive the board through the DOM, the way a player would: they only press
 // squares and read what the page shows. Shared by the end-to-end and screenshot scripts.
 //
-// The board marks every square with data-square ("e4") and data-piece ("white-knight"), and
-// the squares a selected piece may move to with the class "legal-square".
+// The board marks every square with data-square ("e4") and data-piece ("white-knight"), a
+// cooling piece's square with data-cooling="true", and the squares a selected piece may move
+// to with the class "legal-square" ("pending-target" as well while that piece is cooling).
 
 export const SIZES = {
   desktop: { viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 },
@@ -10,88 +11,92 @@ export const SIZES = {
 };
 
 export const square = (page, name) => page.locator(`.board [data-square="${name}"]`);
+export const pieceOn = (page, name) => square(page, name).getAttribute("data-piece");
+export const isCooling = async (page, name) => (await square(page, name).getAttribute("data-cooling")) === "true";
 export const moveCount = (page) => page.locator(".moves-heading span").innerText().then(Number);
-export const turnTitle = (page) => page.locator(".turn-status p").innerText();
-export const isGameOver = async (page) => (await turnTitle(page)) === "Game over";
+export const statusTitle = (page) => page.locator(".turn-status p").innerText();
+export const isGameOver = async (page) => (await statusTitle(page)) === "Game over";
 
-// The move list as SAN strings, in order.
-export const sanList = (page) => page.locator(".move-list .move-san").allInnerTexts();
+// The move feed in order: [{ time: "0:07", side: "white", san: "Nf3" }, ...].
+export const feed = (page) =>
+  page.locator(".move-list .move-entry").evaluateAll((items) =>
+    items.map((item) => ({
+      time: item.querySelector(".move-time")?.textContent ?? "",
+      side: item.classList.contains("black") ? "black" : "white",
+      san: item.querySelector(".move-san")?.textContent ?? ""
+    }))
+  );
+export const sanList = async (page) => (await feed(page)).map((entry) => entry.san);
 
-// Plays one move by clicking its squares. `promotion` picks the piece when the picker opens.
-export async function clickMove(page, from, to, promotion = "queen") {
-  await square(page, from).click();
-  await square(page, to).click();
-  const picker = page.locator(`.promotion-options [data-promotion="${promotion}"]`);
-  if (await picker.count()) await picker.click();
+// Waits for the 3-2-1 to finish: both sides are live.
+export function waitLive(page, timeout = 15000) {
+  return page.waitForFunction(
+    () => {
+      const title = document.querySelector(".turn-status p")?.textContent ?? "";
+      return !document.querySelector(".countdown-layer.counting") && (title === "Live" || title === "Your king is in danger");
+    },
+    null,
+    { timeout }
+  );
 }
 
-// Plays a list of "e2e4"-style moves on one page (pass-and-play), waiting for each to register.
+// Waits until the piece on `name` has finished cooling down.
+export function waitReady(page, name, timeout = 20000) {
+  return page.waitForFunction(
+    (wanted) => {
+      const element = document.querySelector(`.board [data-square="${wanted}"]`);
+      return element?.dataset.piece && element.dataset.cooling !== "true";
+    },
+    name,
+    { timeout }
+  );
+}
+
+// Presses two squares: a piece, then where it goes. Does not wait for anything.
+export async function tap(page, from, to) {
+  await square(page, from).click();
+  await square(page, to).click();
+}
+
+// Plays one "e2e4"-style move as soon as its piece is ready, and waits for it to land.
+export async function playMove(page, move, timeout = 20000) {
+  const from = move.slice(0, 2);
+  const to = move.slice(2, 4);
+  await waitReady(page, from, timeout);
+  const piece = await pieceOn(page, from);
+  await tap(page, from, to);
+  await page.waitForFunction(
+    ([origin, target, wanted]) => {
+      const at = (name) => document.querySelector(`.board [data-square="${name}"]`)?.dataset.piece;
+      // A promoted pawn arrives as a queen of the same colour.
+      return at(target)?.startsWith(wanted.split("-")[0]) && at(origin) !== wanted;
+    },
+    [from, to, piece],
+    { timeout: 8000 }
+  );
+}
+
 export async function playLine(page, moves) {
-  for (const move of moves) {
-    const before = await moveCount(page);
-    await clickMove(page, move.slice(0, 2), move.slice(2, 4), { q: "queen", r: "rook", b: "bishop", n: "knight" }[move[4]] ?? "queen");
-    await page.waitForFunction((n) => Number(document.querySelector(".moves-heading span")?.textContent) > n, before, { timeout: 5000 });
+  for (const move of moves) await playMove(page, move);
+}
+
+// Puts fingers down on several squares at the same instant and lifts them together, through
+// the browser's touch input (Chromium only): what two players do on one phone.
+export async function multiTouch(page, names) {
+  const client = await page.context().newCDPSession(page);
+  const touchPoints = [];
+  for (const [index, name] of names.entries()) {
+    const box = await square(page, name).boundingBox();
+    touchPoints.push({ x: Math.round(box.x + box.width / 2), y: Math.round(box.y + box.height / 2), id: index + 1 });
   }
+  await client.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints });
+  await client.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  await client.detach();
 }
 
 // A small seeded generator so scripted games are repeatable.
 export function seeded(seed) {
   return () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
-}
-
-// Picks and plays a legal move for `side` ("white" | "black") using only the DOM: it clicks the
-// side's pieces until one shows destinations, then prefers a capture. Returns false when no
-// piece of that side can move.
-export async function playAnyLegalMove(page, side, random = Math.random) {
-  const squares = await page
-    .locator(`.board [data-piece^="${side}-"]`)
-    .evaluateAll((elements) => elements.map((element) => element.dataset.square));
-  // Shuffle so the game does not just shuffle one piece back and forth.
-  for (let i = squares.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(random() * (i + 1));
-    [squares[i], squares[j]] = [squares[j], squares[i]];
-  }
-  let quiet = null;
-  for (const from of squares) {
-    // Only pieces with a legal move are clickable ("movable-square").
-    const movable = await square(page, from).evaluate((element) => element.classList.contains("movable-square"));
-    if (!movable) continue;
-    await square(page, from).click();
-    const captures = await page.locator(".board .capture-square").evaluateAll((elements) => elements.map((element) => element.dataset.square));
-    if (captures.length) {
-      await clickTarget(page, captures[Math.floor(random() * captures.length)]);
-      return true;
-    }
-    const targets = await page.locator(".board .legal-square").evaluateAll((elements) => elements.map((element) => element.dataset.square));
-    if (targets.length && (!quiet || random() < 0.35)) quiet = [from, targets[Math.floor(random() * targets.length)]];
-    // Unselect before trying the next piece.
-    await square(page, from).click();
-    if (quiet && random() < 0.5) break;
-  }
-  if (!quiet) return false;
-  await square(page, quiet[0]).click();
-  await clickTarget(page, quiet[1]);
-  return true;
-}
-
-async function clickTarget(page, to) {
-  await square(page, to).click();
-  const picker = page.locator('.promotion-options [data-promotion="queen"]');
-  if (await picker.count()) await picker.click();
-}
-
-// Waits until it is `side`'s turn again (the bot has replied) or the game has ended.
-export function waitForTurn(page, side, timeout = 15000) {
-  const title = side === "white" ? "White" : "Black";
-  return page.waitForFunction(
-    (wanted) => {
-      const status = document.querySelector(".turn-status p")?.textContent ?? "";
-      const busy = document.querySelector(".piece[class*='animate-']");
-      return status === "Game over" || (status.startsWith(wanted) && !busy);
-    },
-    title,
-    { timeout }
-  );
 }
 
 // Collects console errors and page errors for the final report.
@@ -100,11 +105,35 @@ export function watchErrors(page, label, errors) {
   page.on("pageerror", (error) => errors.push(`${label}: ${error.message}`));
 }
 
+const pickCooldown = (page, seconds) => page.locator(`[data-cooldown="${seconds * 1000}"]`).click();
+
+// Home -> Same Screen with the given cooldown. Resolves on the game page, countdown running.
+export async function startSameScreen(page, base, seconds = 3, { flip = false } = {}) {
+  await page.goto(base);
+  await page.getByText("Same Screen").click();
+  await pickCooldown(page, seconds);
+  if (flip) await page.locator(".setting-toggle").click();
+  await page.getByRole("button", { name: "Start game" }).click();
+  await page.waitForURL(/\/local$/);
+}
+
+// Home -> Play a Bot. `side` is "White" or "Black".
+export async function startBot(page, base, { level = "Medium", seconds = 3, side = "White" } = {}) {
+  await page.goto(base);
+  await page.getByText("Play a Bot").click();
+  await page.getByRole("radio", { name: new RegExp(level) }).click();
+  await page.getByRole("radio", { name: side, exact: true }).click();
+  await pickCooldown(page, seconds);
+  await page.getByRole("button", { name: "Start game" }).click();
+  await page.waitForURL(/\/bot$/);
+}
+
 // Creates a private room on `host` (playing `hostSide`) and joins it from `guest`.
-export async function openRoom(host, guest, base, hostSide = "White") {
+export async function openRoom(host, guest, base, { hostSide = "White", seconds = 3 } = {}) {
   await host.goto(`${base}/multiplayer`);
   await host.waitForSelector(".server-state.online", { timeout: 90000 });
-  await host.getByRole("radio", { name: hostSide }).click();
+  await pickCooldown(host, seconds);
+  await host.getByRole("radio", { name: hostSide, exact: true }).click();
   await host.getByRole("button", { name: "Create private room" }).click();
   await host.waitForSelector("text=Waiting for an opponent");
   const code = (await host.locator(".room-code-display span").innerText()).trim();
@@ -116,17 +145,4 @@ export async function openRoom(host, guest, base, hostSide = "White") {
   await host.waitForSelector("text=Online match", { timeout: 20000 });
   await guest.waitForSelector("text=Online match", { timeout: 20000 });
   return code;
-}
-
-// Plays "e2e4"-style moves in an online game, alternating between the two pages.
-export async function playOnlineLine(white, black, moves) {
-  for (const [index, move] of moves.entries()) {
-    const page = index % 2 === 0 ? white : black;
-    await page.waitForSelector("text=Your move", { timeout: 10000 });
-    // The previous move's animation must finish before the board accepts clicks.
-    await page.waitForFunction(() => document.querySelectorAll(".board .movable-square").length > 0, null, { timeout: 10000 });
-    const before = await moveCount(page);
-    await clickMove(page, move.slice(0, 2), move.slice(2, 4), { q: "queen", r: "rook", b: "bishop", n: "knight" }[move[4]] ?? "queen");
-    await page.waitForFunction((n) => Number(document.querySelector(".moves-heading span")?.textContent) > n, before, { timeout: 8000 });
-  }
 }

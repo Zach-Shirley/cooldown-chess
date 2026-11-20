@@ -44,7 +44,7 @@
   --cool-black: #ff7fb2;
   --cool-black-rgb: 255, 127, 178;
   /* Opacity of a piece that is cooling down. */
-  --cooling-opacity: 0.5;
+  --cooling-opacity: 0.6;
   --ready-flash-ms: 480ms;
 
   /* Board (keep in step with art/board.mjs) */

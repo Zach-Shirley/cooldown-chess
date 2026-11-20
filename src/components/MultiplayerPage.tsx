@@ -4,6 +4,7 @@ import {
   ChevronLeft,
   Clipboard,
   ClipboardCheck,
+  Crown,
   DoorOpen,
   Globe,
   Handshake,
@@ -790,7 +791,7 @@ function OnlineGame({
               <Home aria-hidden="true" size={19} />
             </button>
             <div>
-              <p className="section-kicker">Room {snapshot.code} · {cooldownLabel(snapshot.rules)}</p>
+              <p className="section-kicker">Room {snapshot.code} · {snapshot.rules.cooldownMs / 1000} s</p>
               <strong>Online match</strong>
             </div>
             <SoundToggle />
@@ -964,7 +965,7 @@ function GameEventOverlay({
   return (
     <div className="game-event-layer" role="status" aria-live="assertive">
       <section className={`game-event-card result-event ${drawn ? "drawn" : didWin ? "won" : "lost"}`}>
-        <span className="game-event-icon" aria-hidden="true">{drawn ? <Handshake size={28} /> : <Trophy size={28} />}</span>
+        <span className="game-event-icon" aria-hidden="true">{drawn ? <Handshake size={28} /> : kingCaptured ? <Crown size={28} /> : <Trophy size={28} />}</span>
         <p className="section-kicker">{resultLabel}</p>
         <h2>{title}</h2>
         <p>{description}</p>
