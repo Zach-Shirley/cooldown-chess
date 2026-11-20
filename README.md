@@ -14,8 +14,8 @@ Captured by `scripts/tour-screenshots.mjs` at desktop (1440×900) and phone (402
 
 | | |
 |---|---|
-| ![Home](docs/screenshots/desktop-1-home.png) | ![Cooldown rings in a bot game](docs/screenshots/desktop-3b-cooldown-rings.png) |
-| ![Same screen, king in danger](docs/screenshots/phone-4b-king-in-danger.png) | ![Online game](docs/screenshots/phone-7-online-game.png) |
+| ![Home](docs/screenshots/desktop-1-home.webp) | ![Cooldown rings in a bot game](docs/screenshots/desktop-3b-cooldown-rings.webp) |
+| ![Same screen, king in danger](docs/screenshots/phone-4b-king-in-danger.webp) | ![Online game](docs/screenshots/phone-7-online-game.webp) |
 
 ## The rules
 
