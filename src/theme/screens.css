@@ -96,7 +96,7 @@
   border: 1px solid var(--line-strong);
   border-radius: var(--r-lg);
   color: var(--text);
-  background: rgba(30, 20, 22, 0.72);
+  background: rgba(var(--panel-top-rgb), 0.72);
   backdrop-filter: blur(12px);
   text-align: left;
   transition: transform 180ms var(--ease-out), background 180ms, border-color 180ms, box-shadow 180ms;
@@ -104,7 +104,7 @@
 
 .menu-button:hover {
   border-color: rgba(var(--tint-rgb), 0.36);
-  background: rgba(48, 32, 35, 0.82);
+  background: rgba(var(--ink-4-rgb, 33, 49, 65), 0.82);
   transform: translateX(4px);
 }
 
