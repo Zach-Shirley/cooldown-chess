@@ -6,7 +6,7 @@ const W = 1320;
 const H = 2868;
 const CAPTIONS = {
   "1-home": ["Cooldown Chess", "Chess without turns"],
-  "2-local-game": ["Pass & Play", "Two players, one phone"],
+  "2-local-game": ["Same screen", "Two players, both moving at once"],
   "3-bot-game": ["Play the bot", "Easy, medium or hard. Works offline"],
   "4-online-room": ["Play a friend online", "Share a room code to start"],
   "5-online-game": ["Real-time matches", "Private rooms or quick match"]
@@ -26,14 +26,14 @@ for (const [name, [title, subtitle]] of Object.entries(CAPTIONS)) {
     .toBuffer();
   const caption = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="420">
     <text x="${W / 2}" y="190" text-anchor="middle" font-family="Segoe UI, Inter, sans-serif" font-size="96" font-weight="700" fill="#f7f7f2">${title.replace("&", "&amp;")}</text>
-    <text x="${W / 2}" y="290" text-anchor="middle" font-family="Segoe UI, Inter, sans-serif" font-size="54" fill="#cdbfbf">${subtitle}</text>
+    <text x="${W / 2}" y="290" text-anchor="middle" font-family="Segoe UI, Inter, sans-serif" font-size="54" fill="#b8c8d3">${subtitle}</text>
   </svg>`);
-  await sharp({ create: { width: W, height: H, channels: 4, background: "#12090b" } })
+  await sharp({ create: { width: W, height: H, channels: 4, background: "#05080c" } })
     .composite([
       { input: caption, left: 0, top: 0 },
       { input: shot, left: Math.round((W - shotWidth) / 2), top: 400 }
     ])
-    .flatten({ background: "#12090b" })
+    .flatten({ background: "#05080c" })
     .png()
     .toFile(`store/screenshots/framed/${name}.png`);
 }

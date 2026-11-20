@@ -437,7 +437,7 @@ img {
   padding: 20px;
   inset: 0;
   place-items: center;
-  background: rgba(6, 3, 4, 0.72);
+  background: rgba(var(--scrim-rgb), 0.72);
   backdrop-filter: blur(10px);
   animation: backdrop-in 180ms ease both;
 }

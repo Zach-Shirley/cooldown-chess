@@ -137,8 +137,18 @@ for (const size of Object.keys(SIZES)) {
     `${tag} both sides moved within the same second (${entries.map((entry) => `${entry.time} ${entry.side} ${entry.san}`).join(", ")})`
   );
   check((await isCooling(local, "e4")) && (await isCooling(local, "e5")), `${tag} both moved pieces are cooling at the same time`);
-  // The same side can move again at once with another piece.
-  await tap(local, "g1", "f3");
+  // The same side can move again at once with another piece. On desktop the first is a mouse
+  // drag: press on the knight, release on its target.
+  if (size === "desktop") {
+    const from = await square(local, "g1").boundingBox();
+    const to = await square(local, "f3").boundingBox();
+    await local.mouse.move(from.x + from.width / 2, from.y + from.height / 2);
+    await local.mouse.down();
+    await local.mouse.move(to.x + to.width / 2, to.y + to.height / 2, { steps: 6 });
+    await local.mouse.up();
+    await countAtLeast(local, 3);
+    check((await pieceOn(local, "f3")) === "white-knight", `${tag} a piece can be dragged to its target with the mouse`);
+  } else await tap(local, "g1", "f3");
   await tap(local, "f1", "c4");
   await countAtLeast(local, 4);
   check((await sanList(local)).slice(2).join(" ") === "Nf3 Bc4", `${tag} one side moves several pieces in a row`);

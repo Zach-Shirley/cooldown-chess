@@ -1,16 +1,16 @@
-# [GAME NAME] Privacy Policy
+# Cooldown Chess Privacy Policy
 
 _Template, not yet published. Fill in the bracketed fields before linking it from a store listing._
 
 Last updated: [DATE]
 
-[GAME NAME] is made by [LLC LEGAL NAME] ("we"). This policy covers the [GAME NAME] app for iPhone and Android and the website at [WEB URL].
+Cooldown Chess is made by [LLC LEGAL NAME] ("we"). This policy covers the Cooldown Chess app for iPhone and Android and the website at [WEB URL].
 
 ## What we collect
 
-**Nothing that identifies you.** [GAME NAME] has no accounts, no ads, no analytics and no tracking.
+**Nothing that identifies you.** Cooldown Chess has no accounts, no ads, no analytics and no tracking.
 
-**Pass & Play** and **games against the bot** run entirely on your device. Nothing is sent anywhere.
+**Same Screen** and **games against the bot** run entirely on your device. Nothing is sent anywhere.
 
 The first time you open the game it creates a random player ID and a generated display name (like "SwiftFalcon27") and keeps them on your device. They are not linked to your real name, email or any account.
 
@@ -31,7 +31,7 @@ The website is hosted by Vercel and the game server by Render. Like any web host
 
 ## Children
 
-[GAME NAME] is suitable for all ages and does not knowingly collect personal information from anyone, including children under 13.
+Cooldown Chess is suitable for all ages and does not knowingly collect personal information from anyone, including children under 13.
 
 ## Changes
 

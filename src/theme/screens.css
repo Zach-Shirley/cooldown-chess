@@ -25,8 +25,8 @@
 .home-shade {
   position: absolute;
   background:
-    linear-gradient(90deg, rgba(10, 6, 7, 0.96) 0%, rgba(10, 6, 7, 0.82) 34%, rgba(10, 6, 7, 0.1) 72%),
-    linear-gradient(0deg, rgba(10, 6, 7, 0.8), transparent 30%);
+    linear-gradient(90deg, rgba(var(--scrim-rgb), 0.96) 0%, rgba(var(--scrim-rgb), 0.82) 34%, rgba(var(--scrim-rgb), 0.1) 72%),
+    linear-gradient(0deg, rgba(var(--scrim-rgb), 0.8), transparent 30%);
   inset: 0;
 }
 
@@ -579,7 +579,7 @@
   }
 
   .home-shade {
-    background: linear-gradient(0deg, rgba(10, 6, 7, 0.98) 0%, rgba(10, 6, 7, 0.9) 42%, rgba(10, 6, 7, 0.25) 70%, rgba(10, 6, 7, 0.45) 100%);
+    background: linear-gradient(0deg, rgba(var(--scrim-rgb), 0.98) 0%, rgba(var(--scrim-rgb), 0.9) 42%, rgba(var(--scrim-rgb), 0.25) 70%, rgba(var(--scrim-rgb), 0.45) 100%);
   }
 
   .home-menu {

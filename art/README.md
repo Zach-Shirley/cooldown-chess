@@ -11,7 +11,7 @@ Every piece, the board and the home-screen scene are rendered from 3D models, no
 - `render.mjs`: runs the studio in headless Chromium (Playwright, port 4191) and writes the app's assets:
   - `src/assets/pieces/<kind>-<side>.webp`: twelve 288px sprites with a baked contact shadow and a thin dark halo (stronger on ivory, so it stays readable on light squares)
   - `src/assets/hero.webp`, `hero-tall.webp`: home-screen backdrops, a middlegame on a 3D board
-  - `art/piece-icon.png`: source for the app icon
+  - `art/piece-icon.png`: source for the app icon (the black king; `scripts/make-app-icon.mjs` adds the cooldown ring)
 - `board.mjs`: renders the board surface to `src/assets/board.webp`.
 - `contact-sheet.mjs`: review sheet of every sprite on both square colours, large and at 44px (`art/out/`, not committed).
 - `preview-outline.mjs`: fast 2D check of the knight outline.
