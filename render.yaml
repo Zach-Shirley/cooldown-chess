@@ -12,5 +12,4 @@ services:
         value: 0.0.0.0
       - key: CLIENT_ORIGINS
         # capacitor://localhost and https://localhost are the iOS and Android app shells.
-        # LIVE_URL_PLACEHOLDER: replace the first origin with the game's web URL when it is published.
-        value: https://cooldown-chess.example,capacitor://localhost,https://localhost
+        value: https://cooldown-chess.vercel.app,capacitor://localhost,https://localhost

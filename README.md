@@ -2,9 +2,9 @@
 
 Real-time chess with no turns. Either player may move any of their pieces at any moment; a piece that has just moved goes on a cooldown before it can move again; and there is no check or checkmate, so you win by actually capturing the king. Play a bot, share one screen with a friend (both of you tapping at once), or play online.
 
-**Status:** complete and tested locally, not yet deployed. Built in one unattended overnight session; it has never been played by real people, on a real phone or over a real network (see [Verification](#verification)).
+**Status:** complete, deployed and playable. Built in one unattended overnight session; it has never been played by real people, on a real phone or over a real network (see [Verification](#verification)).
 
-**Play it:** LIVE_URL_PLACEHOLDER
+**Play it:** https://cooldown-chess.vercel.app
 
 The free game server sleeps when nobody is playing, so the first online connection can take up to a minute. Bot and same-screen games need no server.
 
